@@ -9,6 +9,7 @@ pub fn run() {
 }
 
 use serde::Serialize;
+use std::sync::LazyLock;
 
 #[derive(Serialize)]
 struct PagedResult {
@@ -21,20 +22,21 @@ fn get_mock_data() -> Vec<String> {
     (1..=100_000).map(|i| format!("Data item {}", i)).collect()
 }
 
+static WORDS: LazyLock<Vec<String>> = LazyLock::new(get_mock_data);
+
 #[tauri::command]
 fn fetch_words(query: String, offset: usize, limit: usize) -> PagedResult {
-    let all_data = get_mock_data();
-
     // Filter based on the query
-    let filtered: Vec<String> = all_data
-        .into_iter()
-        .filter(|w| w.to_lowercase().contains(&query.to_lowercase()))
+    let query = query.to_lowercase();
+    let filtered: Vec<&String> = WORDS
+        .iter()
+        .filter(|w| w.to_lowercase().contains(&query))
         .collect();
 
     let total_count = filtered.len();
 
     // Paginate
-    let items = filtered.into_iter().skip(offset).take(limit).collect();
+    let items = filtered.into_iter().skip(offset).take(limit).cloned().collect();
 
     PagedResult { items, total_count }
 }
