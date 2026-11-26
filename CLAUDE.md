@@ -17,6 +17,8 @@ No test suite or linter config exists yet.
 
 Tauri 2 desktop app: React 19 + TypeScript frontend (`src/`), Rust backend (`src-tauri/`). Prototype stage: the dictionary data is mocked in Rust.
 
+**Target design:** read `docs/spec-v1.md` before any work on dictionary formats, indexing, search, article rendering or the library. It records the agreed v1 decisions and the build order. The prototype described below is what that spec replaces.
+
 **Data flow.** The frontend never holds the full word list. `MainWindow` calls the Rust command `fetch_words(query, offset, limit)`, which filters and paginates server-side and returns `{ items, total_count }`. `total_count` sizes a `@tanstack/react-virtual` list; further pages are fetched when the last virtual row reaches the end of the loaded `items`. The `PagedResult` shape is declared on both sides (`src/App.tsx` and `src-tauri/src/lib.rs`): change them together.
 
 **Multi-window via URL routing.** One frontend bundle serves every window. `App` reads `?word=` from the URL: present → `DetailWindow` (calls `fetch_details`), absent → `MainWindow`. Detail windows are opened from the frontend with `new WebviewWindow("detail-<timestamp>", { url: "/?word=…" })`.
