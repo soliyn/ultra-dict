@@ -23,6 +23,8 @@ Tauri 2 desktop app: React 19 + TypeScript frontend (`src/`), Rust backend (`src
 
 **Formats.** `src-tauri/src/format/` defines the `Format` and `Dictionary` traits and our own types (`EntryLocator`, `Metadata`, `FormatError`). `format/mdict.rs` is the only file allowed to use `mdictlib`: keep its types and errors inside it.
 
+**Library.** `src-tauri/src/library/` is the single seam over dictionaries, the SQLite index (`schema.sql`, versioned by `PRAGMA user_version`), search, articles and history. Callers and `tests/library.rs` use only its public types; `rusqlite` and the format layer stay behind it. Not yet wired into the Tauri commands.
+
 **Data flow.** The frontend never holds the full word list. `MainWindow` calls the Rust command `fetch_words(query, offset, limit)`, which filters and paginates server-side and returns `{ items, total_count }`. `total_count` sizes a `@tanstack/react-virtual` list; further pages are fetched when the last virtual row reaches the end of the loaded `items`. The `PagedResult` shape is declared on both sides (`src/App.tsx` and `src-tauri/src/lib.rs`): change them together.
 
 **Multi-window via URL routing.** One frontend bundle serves every window. `App` reads `?word=` from the URL: present → `DetailWindow` (calls `fetch_details`), absent → `MainWindow`. Detail windows are opened from the frontend with `new WebviewWindow("detail-<timestamp>", { url: "/?word=…" })`.
