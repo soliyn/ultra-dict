@@ -20,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use mdictlib::{Error, MddBuilder, MddFile, MdxBuilder, MdxFile};
+use mdictlib::{Error, MddBuilder, MddFile, MdxBuilder, MdxFile, WriteCompression, WriteOptions};
 
 /// Relative path (with `/` separators) → file bytes.
 type Files = BTreeMap<&'static str, Vec<u8>>;
@@ -92,6 +92,7 @@ fn build_all() -> Files {
     build_loose_css(&mut files);
     build_untitled(&mut files);
     build_encrypted(&mut files);
+    build_damaged(&mut files);
     files
 }
 
@@ -262,6 +263,35 @@ fn build_encrypted(files: &mut Files) {
     );
 }
 
+/// Headwords of `damaged/`, in file order.
+const DAMAGED_KEYS: &[&str] = &[
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+];
+
+/// `damaged/`: opens cleanly but fails part-way through its headwords.
+///
+/// Every key goes in its own uncompressed key block, then the last letter of
+/// the last key (`hotel` → `hotem`) is changed in place. The header and the
+/// key-block index are intact, so the file opens and the first keys
+/// enumerate; the last block no longer matches its index summary, so reading
+/// it fails. This exercises "a failed import leaves nothing behind".
+fn build_damaged(files: &mut Files) {
+    let options = WriteOptions::new()
+        .with_compression(WriteCompression::None)
+        .with_key_block_target_bytes(1);
+    let mut mdx = MdxBuilder::with_options(options);
+    mdx.header_attribute("Title", "Damaged Test Dictionary").unwrap();
+    for key in DAMAGED_KEYS {
+        mdx.add_entry(key, &format!("<div><b>{key}</b></div>")).unwrap();
+    }
+    let mut file = finish_mdx(mdx);
+    // Each uncompressed key row ends with the key and a NUL.
+    let end = key_blocks_end(&file);
+    assert_eq!(&file[end - 6..end], b"hotel ", "last key block layout");
+    file[end - 2] = b'm';
+    files.insert("damaged/damaged.mdx", file);
+}
+
 // ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
@@ -328,6 +358,17 @@ fn verify(dir: &Path) {
         Err(other) => panic!("encrypted.mdx: expected MissingPasscode, got {other}"),
         Ok(_) => panic!("encrypted.mdx opened without a passcode"),
     }
+
+    // damaged
+    let mdx = MdxFile::open(dir.join("damaged/damaged.mdx")).expect("open damaged.mdx");
+    assert_eq!(mdx.len(), DAMAGED_KEYS.len() as u64);
+    let keys: Vec<_> = mdx.keys().collect();
+    let good = keys.iter().take_while(|k| k.is_ok()).count();
+    assert!(
+        good > 0 && good < DAMAGED_KEYS.len(),
+        "damaged.mdx: {good} keys before the error, expected some but not all"
+    );
+    assert!(keys[good].is_err(), "damaged.mdx: enumeration must end in an error");
 }
 
 fn mdd_bytes(mdd: &MddFile, key: &str) -> Vec<u8> {
@@ -352,6 +393,22 @@ fn finish_mdd(builder: MddBuilder) -> Vec<u8> {
     let mut out = Vec::new();
     builder.finish(&mut out).expect("write mdd");
     out
+}
+
+/// Offset just past the key blocks of an unencrypted MDict v2 file.
+///
+/// After the header comes the keyword-section header (five `u64 BE`: block
+/// count, entry count, key-index decompressed length, key-index compressed
+/// length, key-blocks length) and its `u32` Adler-32, then the key index,
+/// then the key blocks.
+fn key_blocks_end(file: &[u8]) -> usize {
+    let header_len = u32::from_be_bytes(file[0..4].try_into().unwrap()) as usize;
+    let section = 4 + header_len + 4;
+    let field = |i: usize| {
+        let at = section + 8 * i;
+        u64::from_be_bytes(file[at..at + 8].try_into().unwrap()) as usize
+    };
+    section + 5 * 8 + 4 + field(3) + field(4)
 }
 
 /// Inserts `name="value"` into the header XML of an MDict v2 file.

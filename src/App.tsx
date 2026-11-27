@@ -1,141 +1,82 @@
-import { useEffect, useState, useRef, FormEvent } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useVirtualizer } from "@tanstack/react-virtual";
+// The single main window: search box and results on one side, the article
+// area on the other.
+
+import { KeyboardEvent, useEffect, useState } from "react";
+import { ResultsList } from "./ResultsList";
+import { strings } from "./strings";
+import { useSearch } from "./useSearch";
 import "./App.css";
 
-interface PagedResult {
-  items: string[];
-  total_count: number;
-}
+const RESULTS_ID = "results";
 
-function MainWindow() {
+export default function App() {
   const [query, setQuery] = useState("");
-  const [items, setItems] = useState<string[]>([]);
-  const [totalCount, setTotalCount] = useState(0);
-  const parentRef = useRef<HTMLDivElement>(null);
+  const results = useSearch(query);
 
-  const fetchPage = async (searchQuery: string, offset: number) => {
-    const res = await invoke<PagedResult>("fetch_words", {
-      query: searchQuery,
-      offset,
-      limit: 50, // Load 50 items per page
-    });
-    setTotalCount(res.total_count);
-    return res.items;
-  };
+  // The highlighted row of the current results, and the headword it holds.
+  // The headword outlives the row: typing a new query keeps it shown.
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [selectedHeadword, setSelectedHeadword] = useState<string | null>(null);
+  const [selectionQuery, setSelectionQuery] = useState(query);
+  if (selectionQuery !== query) {
+    setSelectionQuery(query);
+    setSelectedIndex(null);
+  }
 
-  // Initial load and filter change
+  // The row's headword may still be loading (arrow keys across a page edge).
+  const { item } = results;
   useEffect(() => {
-    fetchPage(query, 0).then(setItems);
-  }, [query]);
+    if (selectedIndex === null) return;
+    const headword = item(selectedIndex);
+    if (headword !== undefined) setSelectedHeadword(headword);
+  }, [item, selectedIndex]);
 
-  const openDetailWindow = (word: string) => {
-    if (!word) return;
-    const windowLabel = `detail-${Date.now()}`;
-    new WebviewWindow(windowLabel, {
-      url: `/?word=${encodeURIComponent(word)}`,
-      title: `Details: ${word}`,
-      width: 600,
-      height: 400,
-    });
-  };
-
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    openDetailWindow(query || items[0]); // Open typed word or first result
-  };
-
-  const rowVirtualizer = useVirtualizer({
-    count: totalCount,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 35, // Height of each row in px
-  });
-
-  // Load more data as the user scrolls down
-  useEffect(() => {
-    const lastVisibleItem = rowVirtualizer.getVirtualItems().at(-1);
-    if (!lastVisibleItem) return;
-
-    if (lastVisibleItem.index >= items.length - 1 && items.length < totalCount) {
-      fetchPage(query, items.length).then((newItems) => {
-        setItems((prev) => [...prev, ...newItems]);
-      });
+  const onSearchKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    const count = results.totalCount ?? 0;
+    if (count === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setSelectedIndex((i) => (i === null ? 0 : Math.min(i + 1, count - 1)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setSelectedIndex((i) => (i === null ? 0 : Math.max(i - 1, 0)));
     }
-  }, [rowVirtualizer.getVirtualItems(), items.length, totalCount, query]);
+  };
 
   return (
-    <div style={{ padding: 20, display: "flex", flexDirection: "column", height: "100vh" }}>
-      <form onSubmit={handleSubmit} style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+    <div className="app">
+      <aside className="sidebar">
         <input
-          type="text"
+          className="search"
+          type="search"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Filter words..."
-          style={{ flex: 1, padding: "8px" }}
+          onKeyDown={onSearchKeyDown}
+          placeholder={strings.searchPlaceholder}
+          aria-label={strings.searchLabel}
+          aria-controls={RESULTS_ID}
+          autoFocus
+          spellCheck={false}
+          autoComplete="off"
         />
-        <button type="submit">Open Details</button>
-      </form>
-
-      {/* Virtualized List Container */}
-      <div
-        ref={parentRef}
-        style={{ flex: 1, overflow: "auto", border: "1px solid #ccc" }}
-      >
-        <div
-          style={{
-            height: `${rowVirtualizer.getTotalSize()}px`,
-            width: "100%",
-            position: "relative",
-          }}
-        >
-          {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-            const item = items[virtualRow.index];
-            return (
-              <div
-                key={virtualRow.index}
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: "100%",
-                  height: `${virtualRow.size}px`,
-                  transform: `translateY(${virtualRow.start}px)`,
-                  padding: "8px",
-                  cursor: "pointer",
-                  borderBottom: "1px solid #eee"
-                }}
-                onClick={() => item && openDetailWindow(item)}
-              >
-                {item || "Loading..."}
-              </div>
-            );
-          })}
+        <ResultsList
+          id={RESULTS_ID}
+          results={results}
+          resultKey={query}
+          selectedIndex={selectedIndex}
+          onSelect={setSelectedIndex}
+        />
+        <div className="status">
+          {results.totalCount ? strings.matchCount(results.totalCount) : " "}
         </div>
-      </div>
+      </aside>
+      <main className="article-pane">
+        {selectedHeadword === null ? (
+          <p className="placeholder">{strings.noSelection}</p>
+        ) : (
+          <h1 className="article-headword">{selectedHeadword}</h1>
+        )}
+      </main>
     </div>
   );
-}
-
-function DetailWindow({ word }: { word: string }) {
-  const [details, setDetails] = useState("Loading...");
-
-  useEffect(() => {
-    invoke<string>("fetch_details", { word }).then(setDetails);
-  }, [word]);
-
-  return (
-    <div style={{ padding: 20 }}>
-      <h2>{word}</h2>
-      <p>{details}</p>
-    </div>
-  );
-}
-
-// Root component routes based on URL params
-export default function App() {
-  const params = new URLSearchParams(window.location.search);
-  const word = params.get("word");
-
-  return word ? <DetailWindow word={word} /> : <MainWindow />;
 }

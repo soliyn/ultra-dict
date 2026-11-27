@@ -18,7 +18,7 @@ Output is byte-for-byte deterministic. Both modes then reopen every fixture with
 
 ## Contents
 
-All dictionaries are MDict v2.0, UTF-8, zlib-compressed, with no encryption unless noted. MDD resource keys use the usual MDict form with a leading backslash (`\img\dot.png`).
+All dictionaries are MDict v2.0 and UTF-8; they are zlib-compressed and unencrypted unless noted. MDD resource keys use the usual MDict form with a leading backslash (`\img\dot.png`).
 
 ### `basic/` — `basic.mdx` + `basic.mdd`
 
@@ -54,6 +54,10 @@ One headword, `nameless`, and no `Title` header, so the display name falls back 
 This stands in for a registration-key dictionary (`Encrypted="1"`). `MdxBuilder` refuses to write encryption, and a real registration-key file can't be committed under a free licence. So the generator builds a plain dictionary (one headword, `secret`) and adds `Encrypted="1"` to its header XML, recomputing the header length and Adler-32 checksum.
 
 The header says the keyword-section header is encrypted, so a reader must reject the file before reading any keys. `mdictlib` fails with `MissingPasscode`, the same error it gives a genuine file. The keyword header itself is **not** really encrypted. The fixture therefore tests detection and rejection only, not decryption, which v1 does not support anyway.
+
+### `damaged/` — `damaged.mdx` (deliberately broken)
+
+Eight headwords (`alpha` … `hotel`), each in its own **uncompressed** key block. After building, the generator changes the last letter of the last key block in place (`hotel` → `hotem`). The header and key-block index are untouched, so the file opens, reports 8 headwords and enumerates the first seven; reading the last block then fails because its keys no longer match the index summary. It tests that a failed import leaves no headwords behind.
 
 ### Not covered
 
