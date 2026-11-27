@@ -7,15 +7,17 @@
 
 mod fold;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
-use crate::format::{self, Dictionary, FormatError};
+use crate::format::{self, Dictionary, EntryLocator, FormatError};
 use fold::fold;
 
 /// Schema version written to `PRAGMA user_version`.
@@ -24,6 +26,9 @@ const SCHEMA_VERSION: i64 = 1;
 /// The user's dictionary collection and its index.
 pub struct Library {
     db: Connection,
+    /// Dictionary readers opened so far, for articles and resources.
+    /// Startup never opens them; each is opened on first use.
+    readers: Mutex<HashMap<DictionaryId, Arc<dyn Dictionary>>>,
 }
 
 impl Library {
@@ -39,7 +44,10 @@ impl Library {
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
         )?;
-        let mut library = Self { db };
+        let mut library = Self {
+            db,
+            readers: Mutex::default(),
+        };
         library.migrate()?;
         Ok(library)
     }
@@ -82,7 +90,11 @@ impl Library {
             Ok(dict) => {
                 let title = dict.metadata().title.clone();
                 match self.insert_indexed(path_text, &title, stamp, dict.as_ref())? {
-                    Ok(id) => return self.get(id),
+                    Ok(id) => {
+                        // Already open: keep it for the articles to come.
+                        self.lock_readers().insert(id, Arc::from(dict));
+                        return self.get(id);
+                    }
                     Err(error) => (title, error),
                 }
             }
@@ -169,6 +181,70 @@ impl Library {
             items,
             total_count: rest_count as u64 + u64::from(exact),
         })
+    }
+
+    /// Every entry for exactly `headword` (case and diacritics significant),
+    /// one section per enabled, ready dictionary that has it, in library
+    /// order. Each section lists its entries in file order.
+    ///
+    /// Entries are raw HTML; redirects (`@@@LINK=…`) are returned as they
+    /// are. A headword no dictionary has gives an article with no sections.
+    pub fn article(&self, headword: &str) -> Result<Article, LibraryError> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT d.id, d.title, d.path, h.locator
+             FROM headwords h JOIN dictionaries d ON d.id = h.dictionary_id
+             WHERE h.folded = ?1 AND h.headword = ?2 AND d.enabled AND d.status = 'ready'
+             ORDER BY d.position, d.id, h.locator",
+        )?;
+        let rows = stmt.query_map(params![fold(headword), headword], |row| {
+            Ok((
+                DictionaryId(row.get(0)?),
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                EntryLocator::from_raw(row.get::<_, i64>(3)? as u64),
+            ))
+        })?;
+
+        // Rows arrive grouped by dictionary.
+        let mut found: Vec<(DictionaryId, String, String, Vec<EntryLocator>)> = Vec::new();
+        for row in rows {
+            let (id, title, path, locator) = row?;
+            match found.last_mut() {
+                Some(last) if last.0 == id => last.3.push(locator),
+                _ => found.push((id, title, path, vec![locator])),
+            }
+        }
+
+        let sections = found
+            .into_iter()
+            .map(|(id, title, path, locators)| {
+                let entries = self
+                    .reader(id, Path::new(&path))
+                    .and_then(|dict| locators.into_iter().map(|l| dict.entry(l)).collect())
+                    .map_err(|e| e.to_string());
+                ArticleSection {
+                    dictionary_id: id,
+                    dictionary_title: title,
+                    entries,
+                }
+            })
+            .collect();
+        Ok(Article { sections })
+    }
+
+    /// The open reader for dictionary `id`, opening `path` if needed.
+    fn reader(&self, id: DictionaryId, path: &Path) -> Result<Arc<dyn Dictionary>, FormatError> {
+        if let Some(dict) = self.lock_readers().get(&id) {
+            return Ok(Arc::clone(dict));
+        }
+        // Open without holding the lock; a racing opener's copy is equal.
+        let dict: Arc<dyn Dictionary> = Arc::from(format::open(path)?);
+        Ok(Arc::clone(self.lock_readers().entry(id).or_insert(dict)))
+    }
+
+    fn lock_readers(&self) -> std::sync::MutexGuard<'_, HashMap<DictionaryId, Arc<dyn Dictionary>>> {
+        // The map stays consistent even if a holder panicked.
+        self.readers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn get(&self, id: DictionaryId) -> Result<DictionaryInfo, LibraryError> {
@@ -270,6 +346,23 @@ const SEARCHABLE: &str =
 
 fn to_sql_int(n: usize) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// What the library has for one headword: see [`Library::article`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Article {
+    /// One per dictionary that has the headword, in library order.
+    pub sections: Vec<ArticleSection>,
+}
+
+/// One dictionary's part of an [`Article`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArticleSection {
+    pub dictionary_id: DictionaryId,
+    pub dictionary_title: String,
+    /// The raw HTML of each entry, in file order, or why the dictionary
+    /// could not be read (e.g. its file has gone).
+    pub entries: Result<Vec<String>, String>,
 }
 
 /// One page of [`Library::search`] results.

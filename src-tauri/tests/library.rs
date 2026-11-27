@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
-use ultra_dict_lib::library::{DictionaryInfo, Library, Status};
+use ultra_dict_lib::library::{Article, DictionaryInfo, Library, Status};
 
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
@@ -295,4 +295,118 @@ fn search_covers_every_ready_dictionary_and_skips_failed_ones() {
 fn search_on_an_empty_library_is_empty() {
     let (_dir, library) = new_library();
     assert_eq!(library.search("", 0, 10).unwrap().total_count, 0);
+}
+
+// --- articles -------------------------------------------------------------
+
+/// The entries of the only section of `headword`'s article.
+fn entries(library: &Library, headword: &str) -> Vec<String> {
+    let article = library.article(headword).unwrap();
+    assert_eq!(article.sections.len(), 1, "{headword:?}: {article:?}");
+    article.sections[0].entries.clone().expect("readable")
+}
+
+#[test]
+fn library_can_be_shared_with_another_thread() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Library>();
+}
+
+#[test]
+fn article_returns_the_entry_html() {
+    let (_dir, library) = basic_library();
+    let article = library.article("go").unwrap();
+    let section = &article.sections[0];
+    assert_eq!(section.dictionary_title, "Basic Test Dictionary");
+    assert_eq!(
+        section.dictionary_id,
+        library.dictionaries().unwrap()[0].id
+    );
+    assert_eq!(
+        section.entries.as_deref().unwrap(),
+        [r#"<div class="entry"><b>go</b> <i>v.</i> (went, gone) to move from one place to another.</div>"#]
+    );
+}
+
+#[test]
+fn article_returns_every_entry_in_file_order() {
+    let (_dir, library) = basic_library();
+    let banks = entries(&library, "bank");
+    assert_eq!(banks.len(), 2);
+    assert!(banks[0].contains("<sup>1</sup>"), "{}", banks[0]);
+    assert!(banks[1].contains("<sup>2</sup>"), "{}", banks[1]);
+}
+
+#[test]
+fn article_matches_the_exact_spelling_only() {
+    let (_dir, library) = basic_library();
+    let polish = entries(&library, "Polish");
+    assert_eq!(polish.len(), 1);
+    assert!(polish[0].contains("of or from Poland"));
+    assert!(entries(&library, "polish")[0].contains("smooth and shiny"));
+    assert!(entries(&library, "résumé")[0].contains("summary"));
+    assert!(entries(&library, "resume")[0].contains("begin again"));
+    assert_eq!(library.article("POLISH").unwrap(), Article { sections: vec![] });
+}
+
+#[test]
+fn unknown_headword_gives_an_empty_article() {
+    let (_dir, library) = basic_library();
+    assert_eq!(library.article("nope").unwrap(), Article { sections: vec![] });
+    assert_eq!(library.article("").unwrap(), Article { sections: vec![] });
+    assert_eq!(library.article("ban").unwrap(), Article { sections: vec![] }, "not a prefix match");
+}
+
+#[test]
+fn redirect_entries_are_returned_as_is() {
+    let (_dir, library) = basic_library();
+    assert_eq!(entries(&library, "went"), ["@@@LINK=go\r\n"]);
+}
+
+#[test]
+fn article_opens_the_dictionary_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    add(&mut Library::open(&db).unwrap(), "basic/basic.mdx");
+    let reopened = Library::open(&db).unwrap();
+    assert!(entries(&reopened, "hello")[0].contains("sound://hello.wav"));
+}
+
+#[test]
+fn article_sections_follow_library_order() {
+    let (dir, mut library) = basic_library();
+    let copy = dir.path().join("copy/basic-copy.mdx");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
+    let second = library.add_file(&copy).unwrap();
+
+    let article = library.article("bank").unwrap();
+    let ids: Vec<_> = article.sections.iter().map(|s| s.dictionary_id).collect();
+    assert_eq!(ids, [library.dictionaries().unwrap()[0].id, second.id]);
+    for section in &article.sections {
+        assert_eq!(section.entries.as_ref().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn unreadable_dictionary_reports_an_error_in_its_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    let copy = dir.path().join("copy/basic-copy.mdx");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
+    Library::open(&db).unwrap().add_file(&copy).unwrap();
+    fs::remove_file(&copy).unwrap();
+
+    let article = Library::open(&db).unwrap().article("go").unwrap();
+    assert_eq!(article.sections.len(), 1);
+    let error = article.sections[0].entries.as_ref().unwrap_err();
+    assert!(error.starts_with("cannot read file"), "{error}");
+}
+
+#[test]
+fn failed_dictionaries_contribute_no_sections() {
+    let (_dir, mut library) = new_library();
+    add(&mut library, "damaged/damaged.mdx");
+    assert_eq!(library.article("alpha").unwrap(), Article { sections: vec![] });
 }
