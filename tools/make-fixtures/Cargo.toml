@@ -1,0 +1,11 @@
+[package]
+name = "make-fixtures"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Generates the tiny MDict test dictionaries in src-tauri/tests/fixtures"
+license = "MIT"
+
+[dependencies]
+# Same pin as the app's MDict adapter (docs/spec-v1.md).
+mdictlib = { version = "=0.2.8", features = ["lzo"] }
