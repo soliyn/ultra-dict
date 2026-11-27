@@ -11,13 +11,14 @@ const ROW_HEIGHT = 30;
 interface Props {
   id: string;
   results: SearchResults;
+  query: string;
   /** Changes whenever the result set is replaced; scrolls back to the top. */
   resultKey: string;
   selectedIndex: number | null;
   onSelect(index: number): void;
 }
 
-export function ResultsList({ id, results, resultKey, selectedIndex, onSelect }: Props) {
+export function ResultsList({ id, results, query, resultKey, selectedIndex, onSelect }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
     count: results.totalCount ?? 0,
@@ -45,7 +46,7 @@ export function ResultsList({ id, results, resultKey, selectedIndex, onSelect }:
 
   let message: string | null = null;
   if (results.error !== null) message = strings.searchFailed(results.error);
-  else if (results.totalCount === 0) message = resultKey === "" ? strings.emptyLibrary : strings.noMatches;
+  else if (results.totalCount === 0) message = query === "" ? strings.emptyLibrary : strings.noMatches;
 
   return (
     <div ref={scrollRef} className="results" id={id} role="listbox" aria-label={strings.resultsLabel}>

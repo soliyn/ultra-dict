@@ -7,6 +7,8 @@ const PAGE_SIZE = 100;
 
 interface State {
   query: string;
+  /** The `libraryVersion` the pages were fetched for. */
+  version: number;
   /** Unknown until the first page for `query` arrives. */
   totalCount: number | null;
   /** Loaded pages by page number. Any page can load first (scrollbar drags). */
@@ -23,33 +25,38 @@ export interface SearchResults {
   loadRange(first: number, last: number): void;
 }
 
-function fresh(query: string): State {
-  return { query, totalCount: null, pages: new Map(), error: null };
+function fresh(query: string, version: number): State {
+  return { query, version, totalCount: null, pages: new Map(), error: null };
 }
 
-export function useSearch(query: string): SearchResults {
-  const [state, setState] = useState(() => fresh(query));
-  // A new query discards the old results before anything renders them.
-  if (state.query !== query) {
-    setState(fresh(query));
+/**
+ * Results for `query`. Bump `libraryVersion` whenever the library's contents
+ * change (a dictionary was added) to fetch them again.
+ */
+export function useSearch(query: string, libraryVersion: number): SearchResults {
+  const [state, setState] = useState(() => fresh(query, libraryVersion));
+  // A new query or library discards the old results before anything renders them.
+  if (state.query !== query || state.version !== libraryVersion) {
+    setState(fresh(query, libraryVersion));
   }
 
-  // Requests in flight, as "page␀query" keys, so no page is fetched twice.
+  // Requests in flight, as "version␀page␀query" keys, so no page is fetched twice.
   const pending = useRef(new Set<string>());
 
   const loadRange = useCallback(
     (first: number, last: number) => {
-      const q = state.query;
+      const { query: q, version } = state;
+      const outdated = (s: State) => s.query !== q || s.version !== version;
       for (let page = Math.floor(first / PAGE_SIZE); page <= Math.floor(last / PAGE_SIZE); page++) {
-        const key = `${page}\u0000${q}`;
+        const key = `${version}\u0000${page}\u0000${q}`;
         if (state.pages.has(page) || pending.current.has(key)) continue;
         pending.current.add(key);
         api
           .search(q, page * PAGE_SIZE, PAGE_SIZE)
           .then((result) =>
-            // Responses for an older query are dropped.
+            // Responses for an older query or library are dropped.
             setState((s) =>
-              s.query !== q
+              outdated(s)
                 ? s
                 : {
                     ...s,
@@ -58,7 +65,7 @@ export function useSearch(query: string): SearchResults {
                   },
             ),
           )
-          .catch((e) => setState((s) => (s.query !== q ? s : { ...s, error: String(e) })))
+          .catch((e) => setState((s) => (outdated(s) ? s : { ...s, error: String(e) })))
           .finally(() => pending.current.delete(key));
       }
     },
