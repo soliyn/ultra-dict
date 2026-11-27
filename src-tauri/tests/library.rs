@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
-use ultra_dict_lib::library::{Article, DictionaryInfo, Library, Status};
+use ultra_dict_lib::library::{Article, DictionaryId, DictionaryInfo, Library, Resource, Status};
 
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
@@ -409,4 +409,153 @@ fn failed_dictionaries_contribute_no_sections() {
     let (_dir, mut library) = new_library();
     add(&mut library, "damaged/damaged.mdx");
     assert_eq!(library.article("alpha").unwrap(), Article { sections: vec![] });
+}
+
+// --- resources ------------------------------------------------------------
+
+fn resource(library: &Library, dict: &DictionaryInfo, path: &str) -> Option<Resource> {
+    library
+        .resource(dict.id, path)
+        .unwrap_or_else(|e| panic!("resource {path:?}: {e}"))
+}
+
+fn resource_text(library: &Library, dict: &DictionaryInfo, path: &str) -> Option<String> {
+    resource(library, dict, path).map(|r| String::from_utf8(r.bytes).unwrap())
+}
+
+/// Copies fixture `rel` (with its `.mdd` volumes) into `dir/sub` and adds it.
+fn add_copy(library: &mut Library, dir: &Path, sub: &str, rel: &str) -> DictionaryInfo {
+    let from = fixture(rel);
+    let folder = dir.join(sub);
+    fs::create_dir_all(&folder).unwrap();
+    let stem = from.file_stem().unwrap().to_str().unwrap().to_owned();
+    for entry in fs::read_dir(from.parent().unwrap()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().unwrap().to_str().unwrap().starts_with(&stem) {
+            fs::copy(&path, folder.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    let info = library.add_file(&folder.join(from.file_name().unwrap())).unwrap();
+    assert_eq!(info.status, Status::Ready);
+    info
+}
+
+#[test]
+fn resources_come_from_the_mdd_with_a_content_type() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+
+    let css = resource(&library, &basic, "basic.css").expect("basic.css");
+    assert_eq!(css.content_type, "text/css");
+    assert!(String::from_utf8(css.bytes).unwrap().contains(".entry"));
+
+    let png = resource(&library, &basic, "img/dot.png").expect("img/dot.png");
+    assert_eq!(png.content_type, "image/png");
+    assert!(png.bytes.starts_with(b"\x89PNG"));
+
+    let wav = resource(&library, &basic, "hello.wav").expect("hello.wav");
+    assert_eq!(wav.content_type, "audio/wav");
+}
+
+#[test]
+fn resource_paths_accept_leading_and_back_slashes() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+    let png = resource(&library, &basic, "img/dot.png").unwrap();
+    for path in ["/img/dot.png", r"\img\dot.png", "///img//./dot.png"] {
+        assert_eq!(resource(&library, &basic, path).as_ref(), Some(&png), "{path:?}");
+    }
+}
+
+#[test]
+fn loose_files_in_the_folder_are_the_fallback() {
+    let (_dir, mut library) = new_library();
+    let loose = add(&mut library, "loose-css/loose.mdx");
+    let css = resource(&library, &loose, "loose.css").expect("loose.css beside the .mdx");
+    assert_eq!(css.content_type, "text/css");
+    assert_eq!(css.bytes, fs::read(fixture("loose-css/loose.css")).unwrap());
+    assert_eq!(resource(&library, &loose, "/loose.css"), Some(css));
+}
+
+#[test]
+fn the_mdd_wins_over_a_loose_file_of_the_same_name() {
+    let (dir, mut library) = new_library();
+    let basic = add_copy(&mut library, dir.path(), "dicts", "basic/basic.mdx");
+    fs::write(dir.path().join("dicts/basic.css"), "/* loose */").unwrap();
+    fs::create_dir_all(dir.path().join("dicts/js")).unwrap();
+    fs::write(dir.path().join("dicts/js/extra.js"), "// loose").unwrap();
+
+    assert!(resource_text(&library, &basic, "basic.css").unwrap().contains(".entry"));
+    let js = resource(&library, &basic, "js/extra.js").expect("only loose");
+    assert_eq!(js.content_type, "text/javascript");
+    assert_eq!(js.bytes, b"// loose");
+}
+
+#[test]
+fn every_mdd_volume_is_searched_in_volume_order() {
+    let (_dir, mut library) = new_library();
+    let multi = add(&mut library, "multivolume/multi.mdx");
+    assert!(resource(&library, &multi, "multi.css").is_some(), "from multi.mdd");
+    assert!(resource(&library, &multi, "img/v1.png").is_some(), "from multi.1.mdd");
+    assert_eq!(
+        resource_text(&library, &multi, "shared.css").as_deref(),
+        Some("/* volume 0 */\n"),
+        "the first volume wins"
+    );
+}
+
+#[test]
+fn missing_resources_are_not_found_not_errors() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+    let loose = add(&mut library, "loose-css/loose.mdx");
+    for path in ["missing.png", "img/", "'+replace(_r,", "basic.css?v=2"] {
+        assert_eq!(resource(&library, &basic, path), None, "{path:?}");
+    }
+    assert_eq!(resource(&library, &loose, "basic.css"), None, "another dictionary's mdd");
+}
+
+#[test]
+fn resources_of_unknown_or_failed_dictionaries_are_not_found() {
+    let (_dir, mut library) = new_library();
+    let damaged = add(&mut library, "damaged/damaged.mdx");
+    assert_eq!(resource(&library, &damaged, "damaged.mdx"), None);
+    assert_eq!(library.resource(DictionaryId::from_raw(999), "basic.css").unwrap(), None);
+}
+
+#[test]
+fn loose_files_still_resolve_when_the_dictionary_file_is_gone() {
+    let (dir, mut library) = new_library();
+    let basic = add_copy(&mut library, dir.path(), "dicts", "basic/basic.mdx");
+    fs::write(dir.path().join("dicts/extra.css"), "/* loose */").unwrap();
+    let db = dir.path().join("library.sqlite3");
+    drop(library);
+    fs::remove_file(dir.path().join("dicts/basic.mdx")).unwrap();
+
+    let library = Library::open(&db).unwrap();
+    assert_eq!(resource(&library, &basic, "basic.css"), None);
+    assert_eq!(resource_text(&library, &basic, "extra.css").as_deref(), Some("/* loose */"));
+}
+
+#[test]
+fn paths_escaping_the_dictionary_folder_are_refused() {
+    let (dir, mut library) = new_library();
+    let basic = add_copy(&mut library, dir.path(), "dicts/basic", "basic/basic.mdx");
+    fs::write(dir.path().join("dicts/secret.txt"), "secret").unwrap();
+    fs::write(dir.path().join("dicts/basic/inside.txt"), "inside").unwrap();
+    let secret = dir.path().join("dicts/secret.txt");
+    let secret = secret.to_str().unwrap();
+
+    for path in [
+        "../secret.txt",
+        r"..\secret.txt",
+        "/../secret.txt",
+        "img/../../secret.txt",
+        "../basic/inside.txt",
+        secret,
+        &secret.replace('\\', "/"),
+    ] {
+        assert_eq!(resource(&library, &basic, path), None, "{path:?}");
+    }
+    assert!(resource(&library, &basic, "inside.txt").is_some(), "the folder itself is served");
 }

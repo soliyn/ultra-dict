@@ -6,6 +6,7 @@
 //! behind it.
 
 mod fold;
+mod resource;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -232,6 +233,46 @@ impl Library {
         Ok(Article { sections })
     }
 
+    /// A resource of dictionary `id` (stylesheet, image, font, sound, …), as
+    /// articles reference it: `path` is relative to the dictionary, with `/`
+    /// or `\` separators; leading separators are ignored.
+    ///
+    /// The dictionary's own resource files (MDict `.mdd` volumes, in volume
+    /// order) are searched first, then loose files in the dictionary's
+    /// folder. `None` means not found. That includes an unknown or unusable
+    /// dictionary, a resource file that can't be read, junk paths, and paths
+    /// that would leave the folder (`..`, absolute paths), which are refused.
+    /// Dictionaries routinely reference resources the user's copy lacks, so
+    /// none of this is an error. `Err` means the database failed.
+    pub fn resource(&self, id: DictionaryId, path: &str) -> Result<Option<Resource>, LibraryError> {
+        let Some(segments) = resource::segments(path) else {
+            return Ok(None);
+        };
+        let dict_path: Option<String> = self
+            .db
+            .prepare_cached("SELECT path FROM dictionaries WHERE id = ?1 AND status = 'ready'")?
+            .query_row([id.0], |row| row.get(0))
+            .optional()?;
+        let Some(dict_path) = dict_path.map(PathBuf::from) else {
+            return Ok(None);
+        };
+        let relative = segments.join("/");
+        let content_type = resource::content_type(&relative);
+
+        // A dictionary or resource file that can't be read only means this
+        // resource isn't there; the article itself reports unreadable files.
+        let bundled = self
+            .reader(id, &dict_path)
+            .and_then(|dict| dict.resource(&relative))
+            .ok()
+            .flatten();
+        let bytes = bundled.or_else(|| {
+            let folder = dict_path.parent()?;
+            fs::read(resource::loose_file(folder, &segments)?).ok()
+        });
+        Ok(bytes.map(|bytes| Resource { bytes, content_type }))
+    }
+
     /// The open reader for dictionary `id`, opening `path` if needed.
     fn reader(&self, id: DictionaryId, path: &Path) -> Result<Arc<dyn Dictionary>, FormatError> {
         if let Some(dict) = self.lock_readers().get(&id) {
@@ -365,6 +406,15 @@ pub struct ArticleSection {
     pub entries: Result<Vec<String>, String>,
 }
 
+/// A dictionary resource: see [`Library::resource`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resource {
+    pub bytes: Vec<u8>,
+    /// MIME type, from the file extension (`application/octet-stream` if
+    /// unknown).
+    pub content_type: &'static str,
+}
+
 /// One page of [`Library::search`] results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPage {
@@ -385,6 +435,13 @@ const SELECT_INFO: &str = "
 pub struct DictionaryId(i64);
 
 impl DictionaryId {
+    /// The id for a number previously produced by [`DictionaryId::to_raw`]
+    /// (e.g. received back from the frontend). An unknown number is not an
+    /// error: lookups treat it as a dictionary that isn't there.
+    pub const fn from_raw(raw: i64) -> Self {
+        Self(raw)
+    }
+
     /// The number to hand to the frontend (and to `dict://` URLs).
     pub const fn to_raw(self) -> i64 {
         self.0

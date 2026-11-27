@@ -1,8 +1,9 @@
 // The article area: every dictionary's entries for one headword, each
 // dictionary in its own sandboxed iframe (docs/spec-v1.md, "Rendering").
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
+import { resolveResources } from "./resources";
 import { strings } from "./strings";
 
 interface Props {
@@ -43,7 +44,11 @@ export function ArticleView({ headword, libraryVersion }: Props) {
             {section.error !== null ? (
               <p className="article-error">{strings.sectionFailed(section.error)}</p>
             ) : (
-              <EntryFrame title={section.dictionaryTitle} entries={section.entries} />
+              <EntryFrame
+                title={section.dictionaryTitle}
+                dictionaryId={section.dictionaryId}
+                entries={section.entries}
+              />
             )}
           </section>
         ))
@@ -59,22 +64,34 @@ body { margin: 8px; font-family: system-ui, "Segoe UI", Roboto, Helvetica, Arial
 .ultra-dict-entry + .ultra-dict-entry { border-top: 1px solid #ddd; margin-top: 12px; padding-top: 12px; }
 </style>`;
 
-function frameDocument(entries: string[]): string {
-  const body = entries.map((html) => `<div class="ultra-dict-entry">${html}</div>`).join("");
+function frameDocument(dictionaryId: number, entries: string[]): string {
+  const body = entries
+    .map((html) => `<div class="ultra-dict-entry">${resolveResources(dictionaryId, html)}</div>`)
+    .join("");
   return `<!doctype html><html><head><meta charset="utf-8">${FRAME_STYLE}</head><body>${body}</body></html>`;
 }
 
 /**
- * One dictionary's entries in an iframe as tall as its content.
+ * One dictionary's entries in an iframe as tall as its content. Their
+ * stylesheets, images and fonts load from the `dict` scheme.
  *
  * The sandbox omits `allow-scripts`, so nothing inside the frame can run,
  * let alone reach the Tauri IPC. It keeps `allow-same-origin` only so this
  * component can read the content height; once a dictionary may run scripts
  * (#12), its frame must drop that and get an opaque origin.
  */
-function EntryFrame({ title, entries }: { title: string; entries: string[] }) {
+function EntryFrame({
+  title,
+  dictionaryId,
+  entries,
+}: {
+  title: string;
+  dictionaryId: number;
+  entries: string[];
+}) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(0);
+  const srcDoc = useMemo(() => frameDocument(dictionaryId, entries), [dictionaryId, entries]);
 
   useEffect(() => {
     const frame = ref.current;
@@ -83,13 +100,22 @@ function EntryFrame({ title, entries }: { title: string; entries: string[] }) {
       const root = frame.contentDocument?.documentElement;
       if (root) setHeight(Math.ceil(root.getBoundingClientRect().height));
     };
-    // The content reflows when the pane's width changes.
+    // The content reflows when the pane's width changes, and grows when
+    // late resources (fonts, images without a size) arrive.
     const observer = new ResizeObserver(measure);
     observer.observe(frame);
-    frame.addEventListener("load", measure);
+    let observedRoot: Element | null = null;
+    const onLoad = () => {
+      // A new article is a new document: watch its root instead.
+      if (observedRoot) observer.unobserve(observedRoot);
+      observedRoot = frame.contentDocument?.documentElement ?? null;
+      if (observedRoot) observer.observe(observedRoot);
+      measure();
+    };
+    frame.addEventListener("load", onLoad);
     return () => {
       observer.disconnect();
-      frame.removeEventListener("load", measure);
+      frame.removeEventListener("load", onLoad);
     };
   }, []);
 
@@ -99,7 +125,7 @@ function EntryFrame({ title, entries }: { title: string; entries: string[] }) {
       className="entry-frame"
       title={title}
       sandbox="allow-same-origin"
-      srcDoc={frameDocument(entries)}
+      srcDoc={srcDoc}
       style={{ height }}
     />
   );
