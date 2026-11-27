@@ -14,6 +14,9 @@
   --selected-bg: #2563eb;
   --selected-fg: #ffffff;
   --focus: #2563eb;
+  --error-fg: #991b1b;
+  --error-bg: #fef2f2;
+  --error-border: #fecaca;
 
   font-family: system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   font-size: 15px;
@@ -35,6 +38,9 @@
     --selected-bg: #3b82f6;
     --selected-fg: #ffffff;
     --focus: #60a5fa;
+    --error-fg: #fecaca;
+    --error-bg: #3b1a1a;
+    --error-border: #7f1d1d;
   }
 }
 
@@ -65,8 +71,15 @@ body,
   background: var(--bg-sidebar);
 }
 
+.toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 10px;
+}
+
 .search {
-  margin: 10px;
+  flex: 1;
+  min-width: 0;
   padding: 6px 10px;
   font: inherit;
   color: var(--fg);
@@ -128,6 +141,58 @@ body,
   border-top: 1px solid var(--border);
 }
 
+.add-file {
+  padding: 6px 10px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.add-file:hover:not(:disabled) {
+  background: var(--row-hover);
+}
+
+.add-file:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.add-file:disabled {
+  color: var(--fg-muted);
+}
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 10px 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--error-fg);
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+
+.notice span {
+  flex: 1;
+}
+
+.notice-dismiss {
+  padding: 0 4px;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
 /* --- article area ------------------------------------------------------- */
 
 .article-pane {
@@ -145,4 +210,26 @@ body,
 
 .placeholder {
   color: var(--fg-muted);
+}
+
+.article-dictionary {
+  margin: 20px 0 6px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.article-error {
+  color: var(--error-fg);
+}
+
+/* Height comes from the content (ArticleView.tsx); the page is always white. */
+.entry-frame {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
 }

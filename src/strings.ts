@@ -12,4 +12,13 @@ export const strings = {
   matchCount: (count: number) =>
     count === 1 ? "1 match" : `${count.toLocaleString("en")} matches`,
   noSelection: "Select a word to see its article.",
+  addFile: "Add file…",
+  adding: "Adding…",
+  dictionaryFilter: "MDict dictionaries",
+  addFailed: (message: string) => `Couldn't add the dictionary: ${message}`,
+  dictionaryUnusable: (title: string, message: string) => `${title} can't be used: ${message}`,
+  dismiss: "Dismiss",
+  noArticle: "No dictionary has this word any more.",
+  articleFailed: (message: string) => `Couldn't open the article: ${message}`,
+  sectionFailed: (message: string) => `Couldn't read this dictionary: ${message}`,
 } as const;

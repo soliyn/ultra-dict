@@ -15,6 +15,7 @@ const LIBRARY_FILE: &str = "library.sqlite3";
 pub fn run() {
     with_commands(Builder::default())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let path = app.path().app_data_dir()?.join(LIBRARY_FILE);
             let library = Library::open(&path)
