@@ -384,6 +384,13 @@ const SELECT_INFO: &str = "
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DictionaryId(i64);
 
+impl DictionaryId {
+    /// The number to hand to the frontend (and to `dict://` URLs).
+    pub const fn to_raw(self) -> i64 {
+        self.0
+    }
+}
+
 impl fmt::Display for DictionaryId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)

@@ -4,9 +4,22 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import "./App.css";
 
-interface PagedResult {
+// Mirrors `SearchPage` in src-tauri/src/commands.rs.
+interface SearchPage {
   items: string[];
-  total_count: number;
+  totalCount: number;
+}
+
+// Mirrors `Article` / `ArticleSection` in src-tauri/src/commands.rs.
+interface ArticleSection {
+  dictionaryId: number;
+  dictionaryTitle: string;
+  entries: string[];
+  error: string | null;
+}
+
+interface Article {
+  sections: ArticleSection[];
 }
 
 function MainWindow() {
@@ -16,12 +29,12 @@ function MainWindow() {
   const parentRef = useRef<HTMLDivElement>(null);
 
   const fetchPage = async (searchQuery: string, offset: number) => {
-    const res = await invoke<PagedResult>("fetch_words", {
+    const res = await invoke<SearchPage>("search", {
       query: searchQuery,
       offset,
       limit: 50, // Load 50 items per page
     });
-    setTotalCount(res.total_count);
+    setTotalCount(res.totalCount);
     return res.items;
   };
 
@@ -54,7 +67,8 @@ function MainWindow() {
 
   // Load more data as the user scrolls down
   useEffect(() => {
-    const lastVisibleItem = rowVirtualizer.getVirtualItems().at(-1);
+    const virtualItems = rowVirtualizer.getVirtualItems();
+    const lastVisibleItem = virtualItems[virtualItems.length - 1];
     if (!lastVisibleItem) return;
 
     if (lastVisibleItem.index >= items.length - 1 && items.length < totalCount) {
@@ -117,17 +131,33 @@ function MainWindow() {
   );
 }
 
+// Interim view until the article ticket: entry HTML is shown as plain text,
+// never rendered (unsandboxed dictionary HTML could reach the IPC).
 function DetailWindow({ word }: { word: string }) {
-  const [details, setDetails] = useState("Loading...");
+  const [article, setArticle] = useState<Article | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    invoke<string>("fetch_details", { word }).then(setDetails);
+    invoke<Article>("article", { headword: word })
+      .then(setArticle)
+      .catch((e) => setError(String(e)));
   }, [word]);
 
   return (
     <div style={{ padding: 20 }}>
       <h2>{word}</h2>
-      <p>{details}</p>
+      {error && <p>{error}</p>}
+      {!article && !error && <p>Loading...</p>}
+      {article?.sections.length === 0 && <p>Not found.</p>}
+      {article?.sections.map((section) => (
+        <section key={section.dictionaryId}>
+          <h3>{section.dictionaryTitle}</h3>
+          {section.error && <p>{section.error}</p>}
+          {section.entries.map((entry, i) => (
+            <pre key={i} style={{ whiteSpace: "pre-wrap" }}>{entry}</pre>
+          ))}
+        </section>
+      ))}
     </div>
   );
 }
