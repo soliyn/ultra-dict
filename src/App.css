@@ -243,6 +243,13 @@ body,
   color: var(--error-fg);
 }
 
+/* Stays in view at the bottom of the pane, near the link that was clicked. */
+.sound-notice {
+  position: sticky;
+  bottom: 0;
+  margin: 12px 0 0;
+}
+
 /* Height comes from the content (ArticleView.tsx); the page is always white. */
 .entry-frame {
   display: block;
