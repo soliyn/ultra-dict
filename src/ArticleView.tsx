@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
-import { resolveResources } from "./resources";
+import { RESOURCE_BASE, resolveResources } from "./resources";
 import { strings } from "./strings";
 
 interface Props {
@@ -16,6 +16,7 @@ type Loaded = { headword: string } & ({ article: api.Article } | { error: string
 
 export function ArticleView({ headword, libraryVersion }: Props) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
+  const [settingError, setSettingError] = useState<string | null>(null);
 
   useEffect(() => {
     let current = true; // responses for an older headword are dropped
@@ -28,11 +29,30 @@ export function ArticleView({ headword, libraryVersion }: Props) {
     };
   }, [headword, libraryVersion]);
 
+  // The setting only changes how sections render, so update them in place
+  // rather than refetching the article.
+  const setAllowScripts = (dictionaryId: number, allow: boolean) => {
+    setSettingError(null);
+    api
+      .setAllowScripts(dictionaryId, allow)
+      .then((info) =>
+        setLoaded((prev) => {
+          if (prev === null || "error" in prev) return prev;
+          const sections = prev.article.sections.map((s) =>
+            s.dictionaryId === info.id ? { ...s, allowScripts: info.allowScripts } : s,
+          );
+          return { ...prev, article: { sections } };
+        }),
+      )
+      .catch((e) => setSettingError(strings.settingFailed(String(e))));
+  };
+
   // Until the new article arrives, keep showing the previous one rather than
   // flashing an empty pane.
   return (
     <article className="article">
       <h1 className="article-headword">{loaded?.headword ?? headword}</h1>
+      {settingError !== null && <p className="article-error">{settingError}</p>}
       {loaded === null ? null : "error" in loaded ? (
         <p className="article-error">{strings.articleFailed(loaded.error)}</p>
       ) : loaded.article.sections.length === 0 ? (
@@ -40,7 +60,19 @@ export function ArticleView({ headword, libraryVersion }: Props) {
       ) : (
         loaded.article.sections.map((section) => (
           <section className="article-section" key={section.dictionaryId}>
-            <h2 className="article-dictionary">{section.dictionaryTitle}</h2>
+            <header className="article-section-header">
+              <h2 className="article-dictionary">{section.dictionaryTitle}</h2>
+              {section.error === null && (
+                <label className="allow-scripts" title={strings.allowScriptsHint}>
+                  <input
+                    type="checkbox"
+                    checked={section.allowScripts}
+                    onChange={(e) => setAllowScripts(section.dictionaryId, e.target.checked)}
+                  />
+                  {strings.allowScripts}
+                </label>
+              )}
+            </header>
             {section.error !== null ? (
               <p className="article-error">{strings.sectionFailed(section.error)}</p>
             ) : (
@@ -48,6 +80,7 @@ export function ArticleView({ headword, libraryVersion }: Props) {
                 title={section.dictionaryTitle}
                 dictionaryId={section.dictionaryId}
                 entries={section.entries}
+                allowScripts={section.allowScripts}
               />
             )}
           </section>
@@ -64,34 +97,91 @@ body { margin: 8px; font-family: system-ui, "Segoe UI", Roboto, Helvetica, Arial
 .ultra-dict-entry + .ultra-dict-entry { border-top: 1px solid #ddd; margin-top: 12px; padding-top: 12px; }
 </style>`;
 
-function frameDocument(dictionaryId: number, entries: string[]): string {
+// Message type a scripted frame uses to report its content height.
+const HEIGHT_MESSAGE = "ultra-dict:height";
+
+// Runs first in a scripted frame: the parent can't look into an opaque-origin
+// document, so the document reports its own height.
+const HEIGHT_REPORTER = `<script>(() => {
+  const root = document.documentElement;
+  const report = () => parent.postMessage(
+    { type: "${HEIGHT_MESSAGE}", height: Math.ceil(root.getBoundingClientRect().height) }, "*");
+  new ResizeObserver(report).observe(root);
+  addEventListener("load", report);
+})();</script>`;
+
+// Second layer for a scripted frame, after the opaque origin: its scripts
+// come only from the `dict` scheme (or inline), and it can open connections
+// to nothing else. That keeps them off Tauri's IPC endpoint and the
+// internet whatever Tauri does with opaque origins. Passive content (images,
+// styles, fonts, media) may still come from `https:` as in a scripts-off
+// frame. A script can't lift a policy once the document has it.
+const SCRIPTED_CSP = [
+  "default-src 'none'",
+  `script-src ${RESOURCE_BASE} 'unsafe-inline' 'unsafe-eval'`,
+  `connect-src ${RESOURCE_BASE}`,
+  `style-src ${RESOURCE_BASE} 'unsafe-inline' https: data:`,
+  `img-src ${RESOURCE_BASE} https: data: blob:`,
+  `font-src ${RESOURCE_BASE} https: data:`,
+  `media-src ${RESOURCE_BASE} https: data: blob:`,
+  "form-action 'none'",
+  "base-uri 'none'",
+].join("; ");
+
+function frameDocument(dictionaryId: number, entries: string[], allowScripts: boolean): string {
   const body = entries
     .map((html) => `<div class="ultra-dict-entry">${resolveResources(dictionaryId, html)}</div>`)
     .join("");
-  return `<!doctype html><html><head><meta charset="utf-8">${FRAME_STYLE}</head><body>${body}</body></html>`;
+  // The policy must come before anything it governs.
+  const scripted = allowScripts
+    ? `<meta http-equiv="Content-Security-Policy" content="${SCRIPTED_CSP}">${HEIGHT_REPORTER}`
+    : "";
+  return `<!doctype html><html><head><meta charset="utf-8">${scripted}${FRAME_STYLE}</head><body>${body}</body></html>`;
+}
+
+interface FrameProps {
+  title: string;
+  dictionaryId: number;
+  entries: string[];
+  allowScripts: boolean;
 }
 
 /**
  * One dictionary's entries in an iframe as tall as its content. Their
  * stylesheets, images and fonts load from the `dict` scheme.
  *
- * The sandbox omits `allow-scripts`, so nothing inside the frame can run,
- * let alone reach the Tauri IPC. It keeps `allow-same-origin` only so this
- * component can read the content height; once a dictionary may run scripts
- * (#12), its frame must drop that and get an opaque origin.
+ * Isolation (docs/spec-v1.md, "Scripts"): a frame may run scripts or share
+ * the app's origin, never both.
+ * - Scripts off: `sandbox="allow-same-origin"`. Nothing inside can run; the
+ *   shared origin only lets this component read the content height.
+ * - Scripts on: `sandbox="allow-scripts"` alone. The frame's origin is
+ *   opaque, so its scripts can't reach into this window, and Tauri refuses
+ *   their IPC requests. It reports its height by `postMessage`.
+ *
+ * Toggling renders the other component, so the frame is recreated: a
+ * sandbox change only applies to a new document anyway.
  */
-function EntryFrame({
-  title,
-  dictionaryId,
-  entries,
-}: {
+function EntryFrame({ title, dictionaryId, entries, allowScripts }: FrameProps) {
+  const srcDoc = useMemo(
+    () => frameDocument(dictionaryId, entries, allowScripts),
+    [dictionaryId, entries, allowScripts],
+  );
+  return allowScripts ? (
+    <ScriptedFrame title={title} srcDoc={srcDoc} />
+  ) : (
+    <StaticFrame title={title} srcDoc={srcDoc} />
+  );
+}
+
+interface DocumentFrameProps {
   title: string;
-  dictionaryId: number;
-  entries: string[];
-}) {
+  srcDoc: string;
+}
+
+/** Scripts off: measured directly through the shared origin. */
+function StaticFrame({ title, srcDoc }: DocumentFrameProps) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(0);
-  const srcDoc = useMemo(() => frameDocument(dictionaryId, entries), [dictionaryId, entries]);
 
   useEffect(() => {
     const frame = ref.current;
@@ -125,6 +215,39 @@ function EntryFrame({
       className="entry-frame"
       title={title}
       sandbox="allow-same-origin"
+      srcDoc={srcDoc}
+      style={{ height }}
+    />
+  );
+}
+
+// Cap on a reported height: the frame's own scripts can post anything.
+const MAX_FRAME_HEIGHT = 200_000;
+
+/** Scripts on: opaque origin; the frame reports its own height. */
+function ScriptedFrame({ title, srcDoc }: DocumentFrameProps) {
+  const ref = useRef<HTMLIFrameElement>(null);
+  const [height, setHeight] = useState(0);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (event.source === null || event.source !== ref.current?.contentWindow) return;
+      const data: unknown = event.data;
+      if (typeof data !== "object" || data === null) return;
+      const { type, height } = data as { type?: unknown; height?: unknown };
+      if (type !== HEIGHT_MESSAGE || typeof height !== "number" || !Number.isFinite(height)) return;
+      setHeight(Math.min(Math.max(Math.ceil(height), 0), MAX_FRAME_HEIGHT));
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  return (
+    <iframe
+      ref={ref}
+      className="entry-frame"
+      title={title}
+      sandbox="allow-scripts"
       srcDoc={srcDoc}
       style={{ height }}
     />

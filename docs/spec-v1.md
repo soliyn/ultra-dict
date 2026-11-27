@@ -81,6 +81,8 @@ Indexing:
 - **Links:** `entry://word` (and equivalent in-dictionary links) become in-app lookups and push history.
 - **Sound:** `sound://…` links play audio the webview supports (mp3, wav, ogg). Other formats show "can't play this format".
 - **Scripts:** dictionary JS is controlled by a per-dictionary "Allow scripts" toggle, default off. Enabled scripts run in a sandboxed, opaque-origin iframe. **Requirement:** a dictionary script must not be able to reach the Tauri IPC / backend commands. This is verified in the first slice.
+  - Verified on Windows (issue #12) with `tools/isolation-check`, which reruns the check against the live app. Tauri injects its internals into every frame, but it refuses IPC from the opaque origin, and a frame's `postMessage` never reaches it.
+  - The app disables Chromium's `IsolateSandboxedIframes`. WebView2 doesn't route an isolated frame process's first requests through custom schemes, so scripted frames would lose their `dict` resources. The opaque origin still provides the isolation.
 
 ## History
 

@@ -16,7 +16,8 @@
         "width": 1000,
         "height": 700,
         "minWidth": 520,
-        "minHeight": 320
+        "minHeight": 320,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,IsolateSandboxedIframes"
       }
     ],
     "security": {

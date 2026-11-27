@@ -22,7 +22,15 @@ use crate::format::{self, Dictionary, EntryLocator, FormatError};
 use fold::fold;
 
 /// Schema version written to `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// `MIGRATIONS[n]` upgrades a schema-version `n + 1` database to `n + 2`.
+/// A new database gets `schema.sql`, which is already the latest version.
+const MIGRATIONS: &[&str] = &[
+    // 1 → 2: per-dictionary "Allow scripts".
+    "ALTER TABLE dictionaries ADD COLUMN allow_scripts INTEGER NOT NULL DEFAULT 0;",
+];
+const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION - 1);
 
 /// The user's dictionary collection and its index.
 pub struct Library {
@@ -55,17 +63,23 @@ impl Library {
 
     fn migrate(&mut self) -> Result<(), LibraryError> {
         let version: i64 = self.db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        match version {
-            0 => {
-                let tx = self.db.transaction()?;
-                tx.execute_batch(include_str!("schema.sql"))?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                tx.commit()?;
-                Ok(())
-            }
-            SCHEMA_VERSION => Ok(()),
-            newer => Err(LibraryError::NewerSchema(newer)),
+        if version > SCHEMA_VERSION {
+            return Err(LibraryError::NewerSchema(version));
         }
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        let tx = self.db.transaction()?;
+        if version == 0 {
+            tx.execute_batch(include_str!("schema.sql"))?;
+        } else {
+            for step in &MIGRATIONS[(version - 1) as usize..] {
+                tx.execute_batch(step)?;
+            }
+        }
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Adds the dictionary file at `path` and indexes it.
@@ -192,7 +206,7 @@ impl Library {
     /// are. A headword no dictionary has gives an article with no sections.
     pub fn article(&self, headword: &str) -> Result<Article, LibraryError> {
         let mut stmt = self.db.prepare_cached(
-            "SELECT d.id, d.title, d.path, h.locator
+            "SELECT d.id, d.title, d.path, d.allow_scripts, h.locator
              FROM headwords h JOIN dictionaries d ON d.id = h.dictionary_id
              WHERE h.folded = ?1 AND h.headword = ?2 AND d.enabled AND d.status = 'ready'
              ORDER BY d.position, d.id, h.locator",
@@ -202,23 +216,33 @@ impl Library {
                 DictionaryId(row.get(0)?),
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                EntryLocator::from_raw(row.get::<_, i64>(3)? as u64),
+                row.get::<_, bool>(3)?,
+                EntryLocator::from_raw(row.get::<_, i64>(4)? as u64),
             ))
         })?;
 
+        /// One dictionary's matching entries, before they are read.
+        struct Found {
+            id: DictionaryId,
+            title: String,
+            path: String,
+            allow_scripts: bool,
+            locators: Vec<EntryLocator>,
+        }
+
         // Rows arrive grouped by dictionary.
-        let mut found: Vec<(DictionaryId, String, String, Vec<EntryLocator>)> = Vec::new();
+        let mut found: Vec<Found> = Vec::new();
         for row in rows {
-            let (id, title, path, locator) = row?;
+            let (id, title, path, allow_scripts, locator) = row?;
             match found.last_mut() {
-                Some(last) if last.0 == id => last.3.push(locator),
-                _ => found.push((id, title, path, vec![locator])),
+                Some(last) if last.id == id => last.locators.push(locator),
+                _ => found.push(Found { id, title, path, allow_scripts, locators: vec![locator] }),
             }
         }
 
         let sections = found
             .into_iter()
-            .map(|(id, title, path, locators)| {
+            .map(|Found { id, title, path, allow_scripts, locators }| {
                 let entries = self
                     .reader(id, Path::new(&path))
                     .and_then(|dict| locators.into_iter().map(|l| dict.entry(l)).collect())
@@ -226,11 +250,29 @@ impl Library {
                 ArticleSection {
                     dictionary_id: id,
                     dictionary_title: title,
+                    allow_scripts,
                     entries,
                 }
             })
             .collect();
         Ok(Article { sections })
+    }
+
+    /// Lets dictionary `id`'s own JavaScript run in its articles, or stops it.
+    /// New dictionaries start with scripts off.
+    pub fn set_allow_scripts(
+        &mut self,
+        id: DictionaryId,
+        allow: bool,
+    ) -> Result<DictionaryInfo, LibraryError> {
+        let changed = self
+            .db
+            .prepare_cached("UPDATE dictionaries SET allow_scripts = ?2 WHERE id = ?1")?
+            .execute(params![id.0, allow])?;
+        if changed == 0 {
+            return Err(LibraryError::UnknownDictionary(id));
+        }
+        self.get(id)
     }
 
     /// A resource of dictionary `id` (stylesheet, image, font, sound, …), as
@@ -401,6 +443,9 @@ pub struct Article {
 pub struct ArticleSection {
     pub dictionary_id: DictionaryId,
     pub dictionary_title: String,
+    /// Whether the dictionary's JavaScript may run: see
+    /// [`Library::set_allow_scripts`].
+    pub allow_scripts: bool,
     /// The raw HTML of each entry, in file order, or why the dictionary
     /// could not be read (e.g. its file has gone).
     pub entries: Result<Vec<String>, String>,
@@ -426,7 +471,7 @@ pub struct SearchPage {
 
 const SELECT_INFO: &str = "
     SELECT d.id, d.path, d.title, d.position, d.enabled, d.file_size, d.file_mtime_ns,
-           d.status, d.error,
+           d.status, d.error, d.allow_scripts,
            (SELECT COUNT(*) FROM headwords h WHERE h.dictionary_id = d.id)
     FROM dictionaries d";
 
@@ -469,6 +514,9 @@ pub struct DictionaryInfo {
     /// `None` if the file could not be read.
     pub file: Option<FileStamp>,
     pub status: Status,
+    /// Whether the dictionary's own JavaScript may run in its articles
+    /// (off for new dictionaries).
+    pub allow_scripts: bool,
     /// Number of indexed headwords (0 unless [`Status::Ready`]).
     pub headword_count: u64,
 }
@@ -493,7 +541,8 @@ impl DictionaryInfo {
                 "ready" => Status::Ready,
                 _ => Status::Error(error.unwrap_or(status)),
             },
-            headword_count: row.get::<_, i64>(9)? as u64,
+            allow_scripts: row.get(9)?,
+            headword_count: row.get::<_, i64>(10)? as u64,
         })
     }
 }
@@ -543,6 +592,8 @@ pub enum LibraryError {
     NewerSchema(i64),
     /// The path cannot be stored because it is not valid Unicode.
     PathNotUnicode(PathBuf),
+    /// No dictionary in the library has this id.
+    UnknownDictionary(DictionaryId),
 }
 
 impl fmt::Display for LibraryError {
@@ -557,6 +608,7 @@ impl fmt::Display for LibraryError {
             Self::PathNotUnicode(p) => {
                 write!(f, "unsupported file path (not valid Unicode): {}", p.display())
             }
+            Self::UnknownDictionary(id) => write!(f, "no dictionary with id {id} in the library"),
         }
     }
 }

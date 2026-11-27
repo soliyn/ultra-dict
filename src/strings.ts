@@ -21,4 +21,7 @@ export const strings = {
   noArticle: "No dictionary has this word any more.",
   articleFailed: (message: string) => `Couldn't open the article: ${message}`,
   sectionFailed: (message: string) => `Couldn't read this dictionary: ${message}`,
+  allowScripts: "Allow scripts",
+  allowScriptsHint: "Run this dictionary's own JavaScript in its articles, isolated from the app.",
+  settingFailed: (message: string) => `Couldn't change the setting: ${message}`,
 } as const;

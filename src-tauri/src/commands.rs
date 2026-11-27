@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::State;
 
-use crate::library::{self, Library, LibraryError};
+use crate::library::{self, DictionaryId, Library, LibraryError};
 use crate::{SharedLibrary, lock_library};
 
 /// Adds one dictionary file. A file that can't be used is still added, with
@@ -47,6 +47,17 @@ pub async fn article(
     with_library(&library, |lib| lib.article(&headword)).map(Article::from)
 }
 
+/// Lets a dictionary's own JavaScript run in its articles, or stops it.
+#[tauri::command]
+pub async fn set_allow_scripts(
+    library: State<'_, SharedLibrary>,
+    dictionary_id: i64,
+    allow: bool,
+) -> Result<DictionaryInfo, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    with_library(&library, |lib| lib.set_allow_scripts(id, allow)).map(DictionaryInfo::from)
+}
+
 fn with_library<T>(
     library: &SharedLibrary,
     call: impl FnOnce(&mut Library) -> Result<T, LibraryError>,
@@ -68,6 +79,7 @@ pub struct DictionaryInfo {
     pub status: &'static str,
     /// Why the dictionary can't be used, when `status` is `"error"`.
     pub error: Option<String>,
+    pub allow_scripts: bool,
     pub headword_count: u64,
 }
 
@@ -85,6 +97,7 @@ impl From<library::DictionaryInfo> for DictionaryInfo {
             enabled: info.enabled,
             status,
             error,
+            allow_scripts: info.allow_scripts,
             headword_count: info.headword_count,
         }
     }
@@ -121,6 +134,8 @@ pub struct Article {
 pub struct ArticleSection {
     pub dictionary_id: i64,
     pub dictionary_title: String,
+    /// Whether the dictionary's JavaScript may run in its frame.
+    pub allow_scripts: bool,
     pub entries: Vec<String>,
     pub error: Option<String>,
 }
@@ -138,6 +153,7 @@ impl From<library::Article> for Article {
                 ArticleSection {
                     dictionary_id: section.dictionary_id.to_raw(),
                     dictionary_title: section.dictionary_title,
+                    allow_scripts: section.allow_scripts,
                     entries,
                     error,
                 }
