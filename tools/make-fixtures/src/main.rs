@@ -90,6 +90,7 @@ fn build_all() -> Files {
     build_basic(&mut files);
     build_multivolume(&mut files);
     build_loose_css(&mut files);
+    build_untitled(&mut files);
     build_encrypted(&mut files);
     files
 }
@@ -232,6 +233,15 @@ fn build_loose_css(files: &mut Files) {
     );
 }
 
+/// `untitled/`: no `Title` header, so the display name falls back to the
+/// file name.
+fn build_untitled(files: &mut Files) {
+    let mut mdx = MdxBuilder::new();
+    mdx.add_entry("nameless", "<div><b>nameless</b> having no name.</div>")
+        .unwrap();
+    files.insert("untitled/untitled.mdx", finish_mdx(mdx));
+}
+
 /// `encrypted/`: substitute for a registration-key (`Encrypted="1"`) file.
 ///
 /// `MdxBuilder` refuses to write encryption, so this builds a plaintext
@@ -306,6 +316,10 @@ fn verify(dir: &Path) {
     assert_eq!(mdx.len(), 1);
     assert!(dir.join("loose-css/loose.css").is_file());
     assert!(!dir.join("loose-css/loose.mdd").exists());
+
+    // untitled
+    let mdx = MdxFile::open(dir.join("untitled/untitled.mdx")).expect("open untitled.mdx");
+    assert_eq!(mdx.header().title(), None);
 
     // encrypted
     let path = dir.join("encrypted/encrypted.mdx");
