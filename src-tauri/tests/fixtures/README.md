@@ -45,6 +45,10 @@ One headword, `volume`, which uses `multi.css` (only in `multi.mdd`), `img/v1.pn
 
 One headword, `loose`, which links `loose.css`. That file is a plain file next to the `.mdx`.
 
+### `untitled/` — `untitled.mdx`
+
+One headword, `nameless`, and no `Title` header, so the display name falls back to the file name.
+
 ### `encrypted/` — `encrypted.mdx` (substitute)
 
 This stands in for a registration-key dictionary (`Encrypted="1"`). `MdxBuilder` refuses to write encryption, and a real registration-key file can't be committed under a free licence. So the generator builds a plain dictionary (one headword, `secret`) and adds `Encrypted="1"` to its header XML, recomputing the header length and Adler-32 checksum.

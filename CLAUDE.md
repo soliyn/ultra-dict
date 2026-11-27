@@ -10,6 +10,7 @@ Package manager is **bun** (Tauri's `beforeDevCommand`/`beforeBuildCommand` call
 - `bun run tauri build`: release bundle.
 - `bun run build`: frontend only (`tsc` type-check + Vite build to `dist/`).
 - `cargo check` / `cargo clippy` / `cargo test`: run from `src-tauri/`.
+- `ULTRA_DICT_REFERENCE_DIR=<dir> cargo test --release --test reference_set -- --ignored --nocapture`: run from `src-tauri/` to smoke-test the format layer against a local folder of real dictionaries.
 - `cargo run` / `cargo run -- --check`: run from `tools/make-fixtures/` to regenerate or verify the MDict test fixtures in `src-tauri/tests/fixtures/` (see the README there).
 
 No test suite or linter config exists yet.
@@ -19,6 +20,8 @@ No test suite or linter config exists yet.
 Tauri 2 desktop app: React 19 + TypeScript frontend (`src/`), Rust backend (`src-tauri/`). Prototype stage: the dictionary data is mocked in Rust.
 
 **Target design:** read `docs/spec-v1.md` before any work on dictionary formats, indexing, search, article rendering or the library. It records the agreed v1 decisions and the build order. The prototype described below is what that spec replaces.
+
+**Formats.** `src-tauri/src/format/` defines the `Format` and `Dictionary` traits and our own types (`EntryLocator`, `Metadata`, `FormatError`). `format/mdict.rs` is the only file allowed to use `mdictlib`: keep its types and errors inside it.
 
 **Data flow.** The frontend never holds the full word list. `MainWindow` calls the Rust command `fetch_words(query, offset, limit)`, which filters and paginates server-side and returns `{ items, total_count }`. `total_count` sizes a `@tanstack/react-virtual` list; further pages are fetched when the last virtual row reaches the end of the loaded `items`. The `PagedResult` shape is declared on both sides (`src/App.tsx` and `src-tauri/src/lib.rs`): change them together.
 
