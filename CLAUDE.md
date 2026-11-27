@@ -17,7 +17,7 @@ No test suite or linter config exists yet.
 
 ## Architecture
 
-Tauri 2 desktop app: React 19 + TypeScript frontend (`src/`), Rust backend (`src-tauri/`). Early v1: the backend is real (Library over SQLite); the UI is one window with an add-file dialog, live search and article view; dictionary resources (`dict://`) are still to come.
+Tauri 2 desktop app: React 19 + TypeScript frontend (`src/`), Rust backend (`src-tauri/`). Early v1: the backend is real (Library over SQLite); the UI is one window with an add-file dialog, live search and article view, with dictionary resources served over `dict://`.
 
 **Target design:** read `docs/spec-v1.md` before any work on dictionary formats, indexing, search, article rendering or the library. It records the agreed v1 decisions and the build order. The prototype described below is what that spec replaces.
 
@@ -28,6 +28,8 @@ Tauri 2 desktop app: React 19 + TypeScript frontend (`src/`), Rust backend (`src
 **Commands.** `src-tauri/src/commands.rs` holds the Tauri commands (`add_file`, `search`, `article`). They lock the `Mutex<Library>` app state (opened in `setup` on `library.sqlite3` in the app data dir), make one Library call, and return camelCase DTOs; errors reject `invoke` with a readable string. The DTO shapes are mirrored as TypeScript interfaces, with typed wrappers, in `src/api.ts`: change both together. `tests/commands.rs` calls them through Tauri's mock IPC.
 
 **Frontend.** One window, plain React hooks and plain CSS (`App.css`, themed with CSS variables and `prefers-color-scheme`); no router or state library. Every UI string lives in `src/strings.ts`. `App` holds the query and selection. `ResultsList` is a `@tanstack/react-virtual` list sized by `totalCount`. `ArticleView` renders each dictionary section in its own iframe sized to its content: `sandbox="allow-same-origin"` without `allow-scripts`, so the parent can measure it and nothing inside can run. Frames that allow scripts (#12) must drop `allow-same-origin`. `App` bumps a `libraryVersion` after each add, and search results and the open article refetch when it changes.
+
+**Resources.** `src-tauri/src/protocol.rs` registers the `dict` URI scheme over `Library::resource` (`.mdd` volumes first, then loose files beside the `.mdx`; `..` and drive paths refused). URLs are `<base><dict-id>/<path>`: the base is `http://dict.localhost/` on Windows (WebView2's only form for custom schemes) and `dict://localhost/` elsewhere, so the id sits in the path, not the host. Root-relative references (`/img/a.png`) would therefore lose the id, so `src/resources.ts` rewrites each entry's resource references to absolute URLs before it goes into the frame. Every response, 404s included, carries `Access-Control-Allow-Origin: *` because fonts load with CORS from the frame's other origin. Anything unresolvable is an empty 404, never an error.
 
 **Data flow.** The frontend never holds the full word list. `useSearch(query)` keeps a cache of fixed-size pages fetched with `search(query, offset, limit)` and loads whichever pages the visible rows need, so a scrollbar drag fetches one page, not every page before it. Responses for an outdated query are dropped.
 

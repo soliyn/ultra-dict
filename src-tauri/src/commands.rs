@@ -10,15 +10,12 @@
 //! commands until it finishes; background indexing is a later step.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
 
 use serde::Serialize;
 use tauri::State;
 
 use crate::library::{self, Library, LibraryError};
-
-/// The library as Tauri state.
-pub type SharedLibrary = Mutex<Library>;
+use crate::{SharedLibrary, lock_library};
 
 /// Adds one dictionary file. A file that can't be used is still added, with
 /// `status: "error"` and a message; only library failures reject.
@@ -54,9 +51,7 @@ fn with_library<T>(
     library: &SharedLibrary,
     call: impl FnOnce(&mut Library) -> Result<T, LibraryError>,
 ) -> Result<T, String> {
-    // A panic mid-call can't leave the database inconsistent (writes are
-    // transactional), so keep serving after one.
-    let mut library = library.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut library = lock_library(library);
     call(&mut library).map_err(|e| e.to_string())
 }
 
