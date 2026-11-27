@@ -1,0 +1,2 @@
+# Fixture bytes are checked by `make-fixtures --check`; never convert line endings.
+src-tauri/tests/fixtures/** -text

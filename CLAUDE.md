@@ -10,6 +10,7 @@ Package manager is **bun** (Tauri's `beforeDevCommand`/`beforeBuildCommand` call
 - `bun run tauri build`: release bundle.
 - `bun run build`: frontend only (`tsc` type-check + Vite build to `dist/`).
 - `cargo check` / `cargo clippy` / `cargo test`: run from `src-tauri/`.
+- `cargo run` / `cargo run -- --check`: run from `tools/make-fixtures/` to regenerate or verify the MDict test fixtures in `src-tauri/tests/fixtures/` (see the README there).
 
 No test suite or linter config exists yet.
 
