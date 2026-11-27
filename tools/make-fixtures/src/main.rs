@@ -159,6 +159,9 @@ const PROBE_JS: &str = r#"(function () {
   function marker(route) { return "ultra-dict-ipc-probe-" + route + ".mdx"; }
 
   document.getElementById("external").textContent = "probe.js (from the .mdd): ran";
+  document.addEventListener("securitypolicyviolation", function (e) {
+    record("CSP blocked", e.effectiveDirective + " " + e.blockedURI);
+  });
   attempt("origin", function () { return window.origin; });
   attempt("typeof __TAURI_INTERNALS__", function () { return typeof window.__TAURI_INTERNALS__; });
   attempt("typeof __TAURI__", function () { return typeof window.__TAURI__; });
@@ -168,6 +171,18 @@ const PROBE_JS: &str = r#"(function () {
   attempt("parent.__TAURI_INTERNALS__", function () { return typeof window.parent.__TAURI_INTERNALS__; });
   attempt("top.location.href", function () { return window.top.location.href; });
   attempt("window.open", function () { return window.open("about:blank") === null ? "blocked" : "opened"; });
+  attempt("document.cookie", function () { document.cookie = "probe=1"; return document.cookie; });
+  attemptAsync("indexedDB.open", function () {
+    return new Promise(function (resolve, reject) {
+      var request = indexedDB.open("probe");
+      request.onsuccess = function () { resolve("opened"); };
+      request.onerror = function () { reject(request.error && request.error.name); };
+    });
+  });
+  attemptAsync("caches.open", function () { return caches.open("probe").then(function () { return "opened"; }); });
+  attemptAsync("fetch https://example.com/", function () {
+    return fetch("https://example.com/", { mode: "no-cors" }).then(function (r) { return r.type; });
+  });
 
   var internals = window.__TAURI_INTERNALS__;
   if (internals && internals.invoke) {

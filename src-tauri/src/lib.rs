@@ -24,7 +24,16 @@ const LIBRARY_FILE: &str = "library.sqlite3";
 
 /// Environment variable naming another library database to open instead,
 /// so manual checks can run without touching the user's own library.
+/// Honoured by debug builds only.
 const LIBRARY_ENV: &str = "ULTRA_DICT_LIBRARY";
+
+fn library_override() -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        std::env::var_os(LIBRARY_ENV).map(PathBuf::from)
+    } else {
+        None
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -32,8 +41,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let path = match std::env::var_os(LIBRARY_ENV) {
-                Some(path) => PathBuf::from(path),
+            let path = match library_override() {
+                Some(path) => path,
                 None => app.path().app_data_dir()?.join(LIBRARY_FILE),
             };
             let library = Library::open(&path)

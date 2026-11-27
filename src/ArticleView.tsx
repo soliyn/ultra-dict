@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
-import { resolveResources } from "./resources";
+import { RESOURCE_BASE, resolveResources } from "./resources";
 import { strings } from "./strings";
 
 interface Props {
@@ -16,7 +16,7 @@ type Loaded = { headword: string } & ({ article: api.Article } | { error: string
 
 export function ArticleView({ headword, libraryVersion }: Props) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
-  const [settingFailed, setSettingFailed] = useState<string | null>(null);
+  const [settingError, setSettingError] = useState<string | null>(null);
 
   useEffect(() => {
     let current = true; // responses for an older headword are dropped
@@ -32,7 +32,7 @@ export function ArticleView({ headword, libraryVersion }: Props) {
   // The setting only changes how sections render, so update them in place
   // rather than refetching the article.
   const setAllowScripts = (dictionaryId: number, allow: boolean) => {
-    setSettingFailed(null);
+    setSettingError(null);
     api
       .setAllowScripts(dictionaryId, allow)
       .then((info) =>
@@ -44,7 +44,7 @@ export function ArticleView({ headword, libraryVersion }: Props) {
           return { ...prev, article: { sections } };
         }),
       )
-      .catch((e) => setSettingFailed(strings.settingFailed(String(e))));
+      .catch((e) => setSettingError(strings.settingFailed(String(e))));
   };
 
   // Until the new article arrives, keep showing the previous one rather than
@@ -52,7 +52,7 @@ export function ArticleView({ headword, libraryVersion }: Props) {
   return (
     <article className="article">
       <h1 className="article-headword">{loaded?.headword ?? headword}</h1>
-      {settingFailed !== null && <p className="article-error">{settingFailed}</p>}
+      {settingError !== null && <p className="article-error">{settingError}</p>}
       {loaded === null ? null : "error" in loaded ? (
         <p className="article-error">{strings.articleFailed(loaded.error)}</p>
       ) : loaded.article.sections.length === 0 ? (
@@ -110,12 +110,33 @@ const HEIGHT_REPORTER = `<script>(() => {
   addEventListener("load", report);
 })();</script>`;
 
+// Second layer for a scripted frame, after the opaque origin: its scripts
+// come only from the `dict` scheme (or inline), and it can open connections
+// to nothing else. That keeps them off Tauri's IPC endpoint and the
+// internet whatever Tauri does with opaque origins. Passive content (images,
+// styles, fonts, media) may still come from `https:` as in a scripts-off
+// frame. A script can't lift a policy once the document has it.
+const SCRIPTED_CSP = [
+  "default-src 'none'",
+  `script-src ${RESOURCE_BASE} 'unsafe-inline' 'unsafe-eval'`,
+  `connect-src ${RESOURCE_BASE}`,
+  `style-src ${RESOURCE_BASE} 'unsafe-inline' https: data:`,
+  `img-src ${RESOURCE_BASE} https: data: blob:`,
+  `font-src ${RESOURCE_BASE} https: data:`,
+  `media-src ${RESOURCE_BASE} https: data: blob:`,
+  "form-action 'none'",
+  "base-uri 'none'",
+].join("; ");
+
 function frameDocument(dictionaryId: number, entries: string[], allowScripts: boolean): string {
   const body = entries
     .map((html) => `<div class="ultra-dict-entry">${resolveResources(dictionaryId, html)}</div>`)
     .join("");
-  const reporter = allowScripts ? HEIGHT_REPORTER : "";
-  return `<!doctype html><html><head><meta charset="utf-8">${reporter}${FRAME_STYLE}</head><body>${body}</body></html>`;
+  // The policy must come before anything it governs.
+  const scripted = allowScripts
+    ? `<meta http-equiv="Content-Security-Policy" content="${SCRIPTED_CSP}">${HEIGHT_REPORTER}`
+    : "";
+  return `<!doctype html><html><head><meta charset="utf-8">${scripted}${FRAME_STYLE}</head><body>${body}</body></html>`;
 }
 
 interface FrameProps {

@@ -7,6 +7,9 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 // `dict://localhost/` on macOS/Linux, `http://dict.localhost/` on Windows.
 const BASE = convertFileSrc("", "dict");
 
+/** Where every resource URL starts, e.g. for a Content-Security-Policy. */
+export const RESOURCE_BASE = BASE;
+
 /** The URL serving `path` (as an article writes it) from dictionary `dictId`. */
 export function resourceUrl(dictId: number, path: string): string {
   const [, rawPath, suffix] = /^([^?#]*)(.*)$/s.exec(path)!;

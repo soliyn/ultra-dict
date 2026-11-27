@@ -221,19 +221,28 @@ impl Library {
             ))
         })?;
 
+        /// One dictionary's matching entries, before they are read.
+        struct Found {
+            id: DictionaryId,
+            title: String,
+            path: String,
+            allow_scripts: bool,
+            locators: Vec<EntryLocator>,
+        }
+
         // Rows arrive grouped by dictionary.
-        let mut found: Vec<(DictionaryId, String, String, bool, Vec<EntryLocator>)> = Vec::new();
+        let mut found: Vec<Found> = Vec::new();
         for row in rows {
             let (id, title, path, allow_scripts, locator) = row?;
             match found.last_mut() {
-                Some(last) if last.0 == id => last.4.push(locator),
-                _ => found.push((id, title, path, allow_scripts, vec![locator])),
+                Some(last) if last.id == id => last.locators.push(locator),
+                _ => found.push(Found { id, title, path, allow_scripts, locators: vec![locator] }),
             }
         }
 
         let sections = found
             .into_iter()
-            .map(|(id, title, path, allow_scripts, locators)| {
+            .map(|Found { id, title, path, allow_scripts, locators }| {
                 let entries = self
                     .reader(id, Path::new(&path))
                     .and_then(|dict| locators.into_iter().map(|l| dict.entry(l)).collect())
