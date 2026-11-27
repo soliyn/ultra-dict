@@ -72,7 +72,9 @@ Indexing:
 ### Rendering
 
 - Each dictionary section renders in its own sandboxed iframe on a white background (dictionary CSS assumes white; the app chrome follows the system light/dark theme).
-- **Resources:** a custom URI scheme `dict://<dict-id>/<path>` serves CSS, JS, images, fonts and audio.
+- **Resources:** a custom URI scheme `dict` serves CSS, JS, images, fonts and audio at `<base><dict-id>/<path>`.
+  - The base is `dict://localhost/`, or `http://dict.localhost/` on Windows, where WebView2 fixes the host. So the id is a path segment, and article HTML is rewritten to absolute resource URLs (root-relative `/img/a.png` included).
+  - Known limitation: inside a served stylesheet, a root-relative `url(/…)` or a `../` climbing above the dictionary root loses the id and is not found. The reference set has this only in leftover web paths.
   - Resolution order: the dictionary's `.mdd` volumes, then loose files in the dictionary's folder. Many dictionaries ship CSS/JS beside the `.mdx`, and some have no `.mdd` at all.
   - Paths escaping the folder (`..`) are refused.
 - **Stylesheets:** articles get whatever stylesheet they link to (no picker in v1, even where a dictionary ships alternative stylesheets).

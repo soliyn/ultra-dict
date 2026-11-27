@@ -11,13 +11,21 @@ fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
 }
 
-/// A library holding `basic` and `loose-css`, and their ids.
-fn library() -> (TempDir, Library, i64, i64) {
+/// A library holding the `basic` and `loose-css` fixtures.
+struct Fixture {
+    _dir: TempDir,
+    library: Library,
+    /// Dictionary ids, as resource URLs carry them.
+    basic: i64,
+    loose: i64,
+}
+
+fn library() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let mut library = Library::open(&dir.path().join("library.sqlite3")).unwrap();
     let basic = library.add_file(&fixture("basic/basic.mdx")).unwrap().id.to_raw();
     let loose = library.add_file(&fixture("loose-css/loose.mdx")).unwrap().id.to_raw();
-    (dir, library, basic, loose)
+    Fixture { _dir: dir, library, basic, loose }
 }
 
 fn header_of(response: &Response<Vec<u8>>, name: header::HeaderName) -> Option<&str> {
@@ -26,7 +34,7 @@ fn header_of(response: &Response<Vec<u8>>, name: header::HeaderName) -> Option<&
 
 #[test]
 fn found_resources_are_served_with_their_type() {
-    let (_dir, library, basic, loose) = library();
+    let Fixture { _dir, library, basic, loose } = library();
 
     let png = respond(&library, &format!("/{basic}/img/dot.png"));
     assert_eq!(png.status(), StatusCode::OK);
@@ -42,7 +50,7 @@ fn found_resources_are_served_with_their_type() {
 #[test]
 fn responses_allow_cross_origin_use() {
     // Fonts load with CORS; article frames have their own origin.
-    let (_dir, library, basic, _) = library();
+    let Fixture { _dir, library, basic, .. } = library();
     for path in [format!("/{basic}/basic.css"), format!("/{basic}/missing.css")] {
         let response = respond(&library, &path);
         assert_eq!(header_of(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), Some("*"));
@@ -51,14 +59,14 @@ fn responses_allow_cross_origin_use() {
 
 #[test]
 fn path_segments_are_percent_decoded() {
-    let (_dir, library, basic, _) = library();
+    let Fixture { _dir, library, basic, .. } = library();
     assert_eq!(respond(&library, &format!("/{basic}/img%2Fdot.png")).status(), StatusCode::OK);
     assert_eq!(respond(&library, &format!("/{basic}/%62asic.css")).status(), StatusCode::OK);
 }
 
 #[test]
 fn anything_unresolvable_is_an_empty_404() {
-    let (_dir, library, basic, loose) = library();
+    let Fixture { _dir, library, basic, loose } = library();
     for path in [
         format!("/{basic}/missing.png"),
         format!("/{basic}/"),

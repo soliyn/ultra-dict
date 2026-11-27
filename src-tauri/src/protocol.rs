@@ -13,13 +13,12 @@
 //! HTML to absolute resource URLs instead.
 
 use std::borrow::Cow;
-use std::sync::PoisonError;
 
 use percent_encoding::percent_decode_str;
 use tauri::http::{Response, StatusCode, header};
 use tauri::{Builder, Manager, Runtime};
 
-use crate::commands::SharedLibrary;
+use crate::{SharedLibrary, lock_library};
 use crate::library::{DictionaryId, Library};
 
 /// The scheme name.
@@ -34,8 +33,7 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         // Off the webview's thread: the library may be busy indexing.
         tauri::async_runtime::spawn_blocking(move || {
             let library = app.state::<SharedLibrary>();
-            let library = library.lock().unwrap_or_else(PoisonError::into_inner);
-            responder.respond(respond(&library, &path));
+            responder.respond(respond(&lock_library(&library), &path));
         });
     })
 }
