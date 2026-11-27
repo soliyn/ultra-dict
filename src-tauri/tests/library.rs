@@ -559,3 +559,104 @@ fn paths_escaping_the_dictionary_folder_are_refused() {
     }
     assert!(resource(&library, &basic, "inside.txt").is_some(), "the folder itself is served");
 }
+
+// --- allow scripts --------------------------------------------------------
+
+#[test]
+fn scripts_are_off_for_new_dictionaries() {
+    let (_dir, mut library) = new_library();
+    assert!(!add(&mut library, "basic/basic.mdx").allow_scripts);
+    assert!(!library.article("go").unwrap().sections[0].allow_scripts);
+}
+
+#[test]
+fn allow_scripts_is_set_per_dictionary_and_shows_in_articles() {
+    let (dir, mut library) = basic_library();
+    let first = library.dictionaries().unwrap()[0].clone();
+    let copy = dir.path().join("copy/basic-copy.mdx");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
+    let second = library.add_file(&copy).unwrap();
+
+    let updated = library.set_allow_scripts(first.id, true).unwrap();
+    assert_eq!(updated, DictionaryInfo { allow_scripts: true, ..first.clone() });
+    let flags: Vec<bool> = library.article("go").unwrap().sections.iter().map(|s| s.allow_scripts).collect();
+    assert_eq!(flags, [true, false]);
+    assert!(!library.dictionaries().unwrap()[1].allow_scripts, "{second:?}");
+
+    assert!(!library.set_allow_scripts(first.id, false).unwrap().allow_scripts);
+}
+
+#[test]
+fn allow_scripts_persists_across_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    {
+        let mut library = Library::open(&db).unwrap();
+        let id = add(&mut library, "basic/basic.mdx").id;
+        library.set_allow_scripts(id, true).unwrap();
+    }
+    assert!(Library::open(&db).unwrap().dictionaries().unwrap()[0].allow_scripts);
+}
+
+#[test]
+fn allow_scripts_on_an_unknown_dictionary_is_an_error() {
+    let (_dir, mut library) = new_library();
+    let error = library.set_allow_scripts(DictionaryId::from_raw(7), true).unwrap_err();
+    assert_eq!(error.to_string(), "no dictionary with id 7 in the library");
+}
+
+#[test]
+fn a_version_1_library_is_upgraded_in_place() {
+    // The schema as v0.1 created it, with one indexed dictionary.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dictionaries (
+                 id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+                 position INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+                 file_size INTEGER, file_mtime_ns INTEGER, status TEXT NOT NULL, error TEXT);
+             CREATE TABLE headwords (
+                 id INTEGER PRIMARY KEY,
+                 dictionary_id INTEGER NOT NULL REFERENCES dictionaries (id) ON DELETE CASCADE,
+                 headword TEXT NOT NULL, folded TEXT NOT NULL, locator INTEGER NOT NULL);
+             CREATE INDEX headwords_by_folded ON headwords (folded, headword, dictionary_id);
+             CREATE INDEX headwords_by_dictionary ON headwords (dictionary_id);
+             CREATE TABLE history (
+                 id INTEGER PRIMARY KEY, headword TEXT NOT NULL, looked_up_at INTEGER NOT NULL);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO dictionaries (path, title, position, status) VALUES (?1, 'Old', 0, 'ready')",
+            [fixture("basic/basic.mdx").to_str().unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO headwords (dictionary_id, headword, folded, locator) VALUES (1, 'go', 'go', 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let mut library = Library::open(&db).unwrap();
+    let old = library.dictionaries().unwrap().remove(0);
+    assert_eq!((old.title.as_str(), old.allow_scripts), ("Old", false));
+    assert_eq!(library.search("g", 0, 10).unwrap().items, ["go"]);
+    assert!(library.set_allow_scripts(old.id, true).unwrap().allow_scripts);
+    drop(library);
+    assert!(Library::open(&db).unwrap().dictionaries().unwrap()[0].allow_scripts, "reopens");
+}
+
+#[test]
+fn dictionary_scripts_are_served_from_the_mdd_and_the_folder() {
+    let (_dir, mut library) = new_library();
+    let scripts = add(&mut library, "scripts/scripts.mdx");
+    let probe = resource(&library, &scripts, "probe.js").expect("probe.js from scripts.mdd");
+    assert_eq!(probe.content_type, "text/javascript");
+    let loose = resource(&library, &scripts, "loose.js").expect("loose.js beside the .mdx");
+    assert_eq!(loose.content_type, "text/javascript");
+    assert_eq!(loose.bytes, fs::read(fixture("scripts/loose.js")).unwrap());
+}

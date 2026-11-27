@@ -59,6 +59,10 @@ The header says the keyword-section header is encrypted, so a reader must reject
 
 Eight headwords (`alpha` … `hotel`), each in its own **uncompressed** key block. After building, the generator changes the last letter of the last key block in place (`hotel` → `hotem`). The header and key-block index are untouched, so the file opens, reports 8 headwords and enumerates the first seven; reading the last block then fails because its keys no longer match the index summary. It tests that a failed import leaves no headwords behind.
 
+### `scripts/` — `scripts.mdx` + `scripts.mdd` + `loose.js`
+
+One headword, `probe`, for the "Allow scripts" isolation check (`tools/isolation-check`). The entry has three scripts, and each one replaces a "did not run" line when it runs: an inline script, `probe.js` (only in `scripts.mdd`) and `loose.js` (a plain file beside the `.mdx`). `probe.js` also tries every route from the frame to the app and its backend, and writes the outcome into the page. Routes that could change anything call `add_file` with a marker path (`ultra-dict-ipc-probe-<route>.mdx`).
+
 ### Not covered
 
 - MDX v1.2 files and LZO compression: `MdxBuilder` writes only v2.0 with zlib or no compression. These are covered by the manual reference set instead.

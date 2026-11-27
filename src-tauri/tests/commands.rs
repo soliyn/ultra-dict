@@ -72,6 +72,7 @@ fn add_file_returns_the_dictionary() {
     assert_eq!(info["enabled"], true);
     assert_eq!(info["status"], "ready");
     assert_eq!(info["error"], Value::Null);
+    assert_eq!(info["allowScripts"], false);
     assert_eq!(info["headwordCount"], 19);
 }
 
@@ -102,6 +103,7 @@ fn article_returns_sections_with_entries() {
     assert_eq!(section["dictionaryId"], id);
     assert_eq!(section["dictionaryTitle"], "Basic Test Dictionary");
     assert_eq!(section["error"], Value::Null);
+    assert_eq!(section["allowScripts"], false);
     let entries = section["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
     assert!(entries[0].as_str().unwrap().contains("<sup>1</sup>"));
@@ -116,4 +118,21 @@ fn bad_arguments_reject_with_a_message() {
     let error = app.invoke("search", json!({ "query": "a" })).unwrap_err();
     let message = error.as_str().unwrap_or_default();
     assert!(message.contains("offset"), "{error}");
+}
+
+#[test]
+fn set_allow_scripts_returns_the_updated_dictionary() {
+    let app = TestApp::new();
+    let id = app.add("basic/basic.mdx")["id"].clone();
+    let info = app
+        .invoke("set_allow_scripts", json!({ "dictionaryId": id, "allow": true }))
+        .unwrap();
+    assert_eq!(info["allowScripts"], true);
+    let article = app.invoke("article", json!({ "headword": "go" })).unwrap();
+    assert_eq!(article["sections"][0]["allowScripts"], true);
+
+    let error = app
+        .invoke("set_allow_scripts", json!({ "dictionaryId": 999, "allow": true }))
+        .unwrap_err();
+    assert_eq!(error, "no dictionary with id 999 in the library");
 }

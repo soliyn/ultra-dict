@@ -3,6 +3,7 @@ pub mod format;
 pub mod library;
 pub mod protocol;
 
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use tauri::{Builder, Manager, Runtime};
@@ -21,13 +22,20 @@ pub(crate) fn lock_library(library: &SharedLibrary) -> MutexGuard<'_, Library> {
 /// File name of the library database inside the app data directory.
 const LIBRARY_FILE: &str = "library.sqlite3";
 
+/// Environment variable naming another library database to open instead,
+/// so manual checks can run without touching the user's own library.
+const LIBRARY_ENV: &str = "ULTRA_DICT_LIBRARY";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     protocol::register(with_commands(Builder::default()))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let path = app.path().app_data_dir()?.join(LIBRARY_FILE);
+            let path = match std::env::var_os(LIBRARY_ENV) {
+                Some(path) => PathBuf::from(path),
+                None => app.path().app_data_dir()?.join(LIBRARY_FILE),
+            };
             let library = Library::open(&path)
                 .map_err(|e| format!("cannot open the library at {}: {e}", path.display()))?;
             app.manage(Mutex::new(library));
@@ -46,5 +54,6 @@ pub fn with_commands<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         commands::add_file,
         commands::search,
         commands::article,
+        commands::set_allow_scripts,
     ])
 }

@@ -12,6 +12,8 @@ export interface DictionaryInfo {
   status: "ready" | "error";
   /** Why the dictionary can't be used, when `status` is `"error"`. */
   error: string | null;
+  /** Whether the dictionary's own JavaScript may run in its articles. */
+  allowScripts: boolean;
   headwordCount: number;
 }
 
@@ -23,6 +25,8 @@ export interface SearchPage {
 export interface ArticleSection {
   dictionaryId: number;
   dictionaryTitle: string;
+  /** Whether the dictionary's JavaScript may run in its frame. */
+  allowScripts: boolean;
   /** Raw entry HTML, in file order. Empty when `error` is set. */
   entries: string[];
   error: string | null;
@@ -44,4 +48,8 @@ export function search(query: string, offset: number, limit: number): Promise<Se
 
 export function article(headword: string): Promise<Article> {
   return invoke("article", { headword });
+}
+
+export function setAllowScripts(dictionaryId: number, allow: boolean): Promise<DictionaryInfo> {
+  return invoke("set_allow_scripts", { dictionaryId, allow });
 }

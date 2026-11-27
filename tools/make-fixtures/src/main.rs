@@ -93,8 +93,118 @@ fn build_all() -> Files {
     build_untitled(&mut files);
     build_encrypted(&mut files);
     build_damaged(&mut files);
+    build_scripts(&mut files);
     files
 }
+
+/// `scripts/`: a dictionary that ships JavaScript, for the "Allow scripts"
+/// isolation check (issue #12): an inline script, `probe.js` in the `.mdd`
+/// and `loose.js` beside the `.mdx`. Each one marks the page when it runs;
+/// `probe.js` also tries every route to the app and its backend and writes
+/// the outcome into the page.
+fn build_scripts(files: &mut Files) {
+    let mut mdx = MdxBuilder::new();
+    mdx.header_attribute("Title", "Scripts Test Dictionary").unwrap();
+    mdx.add_entry("probe", SCRIPTS_ENTRY).unwrap();
+    files.insert("scripts/scripts.mdx", finish_mdx(mdx));
+
+    let mut mdd = MddBuilder::new();
+    mdd.add_resource("\\probe.js", PROBE_JS.as_bytes()).unwrap();
+    files.insert("scripts/scripts.mdd", finish_mdd(mdd));
+    files.insert(
+        "scripts/loose.js",
+        b"document.getElementById(\"loose\").textContent = \"loose.js (beside the .mdx): ran\";\n"
+            .to_vec(),
+    );
+}
+
+const SCRIPTS_ENTRY: &str = concat!(
+    r#"<div class="entry"><b>probe</b> isolation probe<ul>"#,
+    r#"<li id="inline">inline script: did not run</li>"#,
+    r#"<li id="external">probe.js (from the .mdd): did not run</li>"#,
+    r#"<li id="loose">loose.js (beside the .mdx): did not run</li>"#,
+    r#"</ul><pre id="report"></pre></div>"#,
+    r#"<script>document.getElementById("inline").textContent = "inline script: ran";</script>"#,
+    r#"<script src="loose.js"></script>"#,
+    r#"<script src="probe.js"></script>"#,
+);
+
+/// Tries to reach the app window and the Tauri backend from inside the
+/// dictionary's frame. Every attempt that could change anything calls
+/// `add_file` with a marker path (`ultra-dict-ipc-probe-<route>.mdx`): the
+/// library records even a missing file, so a marker in the library database
+/// means that route reached the backend.
+const PROBE_JS: &str = r#"(function () {
+  var results = [];
+  function record(check, outcome) {
+    results.push(check + ": " + outcome);
+    document.getElementById("report").textContent = results.join("\n");
+  }
+  function text(value) {
+    try { return String(JSON.stringify(value)).slice(0, 200); } catch (e) { return String(value); }
+  }
+  function attempt(check, run) {
+    try { record(check, "ok " + text(run())); } catch (e) { record(check, "threw " + (e && e.name)); }
+  }
+  function attemptAsync(check, run) {
+    var settled = false;
+    function settle(outcome) { if (!settled) { settled = true; record(check, outcome); } }
+    try {
+      Promise.resolve(run()).then(
+        function (v) { settle("resolved " + text(v)); },
+        function (e) { settle("rejected " + text(e && (e.message || e))); });
+    } catch (e) { settle("threw " + (e && e.name)); }
+    setTimeout(function () { settle("no answer after 5 s"); }, 5000);
+  }
+  function marker(route) { return "ultra-dict-ipc-probe-" + route + ".mdx"; }
+
+  document.getElementById("external").textContent = "probe.js (from the .mdd): ran";
+  attempt("origin", function () { return window.origin; });
+  attempt("typeof __TAURI_INTERNALS__", function () { return typeof window.__TAURI_INTERNALS__; });
+  attempt("typeof __TAURI__", function () { return typeof window.__TAURI__; });
+  attempt("typeof chrome.webview", function () { return typeof (window.chrome && window.chrome.webview); });
+  attempt("localStorage", function () { return window.localStorage.length; });
+  attempt("parent.document", function () { return typeof window.parent.document; });
+  attempt("parent.__TAURI_INTERNALS__", function () { return typeof window.parent.__TAURI_INTERNALS__; });
+  attempt("top.location.href", function () { return window.top.location.href; });
+  attempt("window.open", function () { return window.open("about:blank") === null ? "blocked" : "opened"; });
+
+  var internals = window.__TAURI_INTERNALS__;
+  if (internals && internals.invoke) {
+    attemptAsync("invoke add_file (injected internals)", function () {
+      return internals.invoke("add_file", { path: marker("internals") });
+    });
+  }
+  ["http://ipc.localhost/add_file", "ipc://localhost/add_file"].forEach(function (url, i) {
+    attemptAsync("fetch " + url, function () {
+      return fetch(url, {
+        method: "POST",
+        body: JSON.stringify({ path: marker("fetch" + i) }),
+        headers: { "Content-Type": "application/json", "Tauri-Callback": "1", "Tauri-Error": "2",
+                   "Tauri-Invoke-Key": "guess" }
+      }).then(function (r) { return r.status; });
+    });
+  });
+  // Tauri's injected IPC falls back to `window.ipc.postMessage`, carrying
+  // the real invoke key, when its `fetch` fails. Force that path.
+  if (internals && internals.invoke) {
+    setTimeout(function () {
+      window.fetch = function () { return Promise.reject(new TypeError("fetch disabled by probe")); };
+      attemptAsync("invoke add_file (forced postMessage fallback, real key)", function () {
+        return internals.invoke("add_file", { path: marker("fallback") });
+      });
+    }, 1500);
+  }
+  var webview = window.chrome && window.chrome.webview;
+  if (webview && webview.postMessage) {
+    attempt("chrome.webview.postMessage add_file", function () {
+      webview.postMessage(JSON.stringify({ cmd: "add_file", callback: 1, error: 2, options: {},
+        payload: { path: marker("postmessage") }, __TAURI_INVOKE_KEY__: "guess" }));
+      return "sent";
+    });
+  }
+})();
+"#;
 
 /// `basic/`: headword edge cases, redirects, and resources in a single `.mdd`.
 fn build_basic(files: &mut Files) {
@@ -369,6 +479,13 @@ fn verify(dir: &Path) {
         "damaged.mdx: {good} keys before the error, expected some but not all"
     );
     assert!(keys[good].is_err(), "damaged.mdx: enumeration must end in an error");
+
+    // scripts
+    let mdx = MdxFile::open(dir.join("scripts/scripts.mdx")).expect("open scripts.mdx");
+    assert_eq!(mdx.len(), 1);
+    let mdd = MddFile::open(dir.join("scripts/scripts.mdd")).expect("open scripts.mdd");
+    assert_eq!(mdd_bytes(&mdd, "\\probe.js"), PROBE_JS.as_bytes());
+    assert!(dir.join("scripts/loose.js").is_file());
 }
 
 fn mdd_bytes(mdd: &MddFile, key: &str) -> Vec<u8> {

@@ -212,8 +212,26 @@ body,
   color: var(--fg-muted);
 }
 
-.article-dictionary {
+.article-section-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
   margin: 20px 0 6px;
+}
+
+.allow-scripts {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.article-dictionary {
+  margin: 0;
   font-size: 0.85rem;
   font-weight: 600;
   color: var(--fg-muted);

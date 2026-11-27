@@ -1,4 +1,7 @@
--- Library database, schema version 1 (PRAGMA user_version).
+-- Library database, schema version 2 (PRAGMA user_version).
+--
+-- This file creates the latest schema on a new database. Upgrades of
+-- existing ones are the MIGRATIONS in mod.rs: change both together.
 --
 -- Dictionary groups (out of v1) will be their own tables referencing
 -- dictionaries(id); nothing here assumes a single flat collection beyond
@@ -20,7 +23,9 @@ CREATE TABLE dictionaries (
     -- 'ready' or 'error'.
     status        TEXT    NOT NULL,
     -- Human-readable reason when status is 'error'.
-    error         TEXT
+    error         TEXT,
+    -- Whether the dictionary's own JavaScript may run in its articles.
+    allow_scripts INTEGER NOT NULL DEFAULT 0
 );
 
 -- Every headword of every successfully indexed dictionary.
