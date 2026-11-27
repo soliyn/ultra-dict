@@ -607,7 +607,7 @@ fn allow_scripts_on_an_unknown_dictionary_is_an_error() {
 }
 
 #[test]
-fn a_version_1_library_is_upgraded_in_place() {
+fn an_old_library_is_upgraded_in_place() {
     // The schema as v0.1 created it, with one indexed dictionary.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("library.sqlite3");
@@ -645,9 +645,13 @@ fn a_version_1_library_is_upgraded_in_place() {
     let old = library.dictionaries().unwrap().remove(0);
     assert_eq!((old.title.as_str(), old.allow_scripts), ("Old", false));
     assert_eq!(library.search("g", 0, 10).unwrap().items, ["go"]);
+    assert_eq!(old.file_title, "Old");
     assert!(library.set_allow_scripts(old.id, true).unwrap().allow_scripts);
+    assert_eq!(library.rename(old.id, "New").unwrap().title, "New");
     drop(library);
-    assert!(Library::open(&db).unwrap().dictionaries().unwrap()[0].allow_scripts, "reopens");
+    let reopened = Library::open(&db).unwrap().dictionaries().unwrap().remove(0);
+    assert!(reopened.allow_scripts, "reopens");
+    assert_eq!((reopened.title.as_str(), reopened.file_title.as_str()), ("New", "Old"));
 }
 
 #[test]
@@ -659,4 +663,248 @@ fn dictionary_scripts_are_served_from_the_mdd_and_the_folder() {
     let loose = resource(&library, &scripts, "loose.js").expect("loose.js beside the .mdx");
     assert_eq!(loose.content_type, "text/javascript");
     assert_eq!(loose.bytes, fs::read(fixture("scripts/loose.js")).unwrap());
+}
+
+// --- library management ---------------------------------------------------
+
+/// `basic.mdx` and a copy of it in another folder: two dictionaries with the
+/// same headwords.
+fn two_basic_dictionaries() -> (TempDir, Library, DictionaryInfo, DictionaryInfo) {
+    let (dir, mut library) = new_library();
+    let first = add(&mut library, "basic/basic.mdx");
+    let copy = dir.path().join("copy/basic-copy.mdx");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
+    let second = library.add_file(&copy).unwrap();
+    (dir, library, first, second)
+}
+
+fn section_ids(library: &Library, headword: &str) -> Vec<DictionaryId> {
+    library.article(headword).unwrap().sections.iter().map(|s| s.dictionary_id).collect()
+}
+
+#[test]
+fn disabled_dictionaries_drop_out_of_search_and_articles() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+    let untitled = add(&mut library, "untitled/untitled.mdx");
+
+    let updated = library.set_enabled(basic.id, false).unwrap();
+    assert_eq!(updated, DictionaryInfo { enabled: false, ..basic.clone() });
+    assert_eq!(search_all(&library, "go"), [] as [&str; 0]);
+    assert_eq!(search_all(&library, ""), ["nameless"]);
+    assert_eq!(library.article("go").unwrap(), Article { sections: vec![] });
+    assert_eq!(section_ids(&library, "nameless"), [untitled.id]);
+
+    assert!(library.set_enabled(basic.id, true).unwrap().enabled);
+    assert_eq!(search_all(&library, "go"), ["go"]);
+    assert_eq!(section_ids(&library, "go"), [basic.id]);
+}
+
+#[test]
+fn disabling_one_copy_keeps_the_other_section() {
+    let (_dir, mut library, first, second) = two_basic_dictionaries();
+    library.set_enabled(first.id, false).unwrap();
+    assert_eq!(section_ids(&library, "bank"), [second.id]);
+    assert_eq!(search_all(&library, "bank"), ["bank"]);
+}
+
+fn titles_in_order(library: &Library) -> Vec<(u32, String)> {
+    library.dictionaries().unwrap().into_iter().map(|d| (d.position, d.title)).collect()
+}
+
+fn three_dictionaries() -> (TempDir, Library, [DictionaryId; 3]) {
+    let (dir, mut library) = new_library();
+    let ids = [
+        add(&mut library, "basic/basic.mdx").id,
+        add(&mut library, "encrypted/encrypted.mdx").id,
+        add(&mut library, "untitled/untitled.mdx").id,
+    ];
+    (dir, library, ids)
+}
+
+#[test]
+fn moving_a_dictionary_reorders_the_library() {
+    let (_dir, mut library, [basic, encrypted, untitled]) = three_dictionaries();
+
+    let listed = library.move_dictionary(untitled, 0).unwrap();
+    assert_eq!(listed, library.dictionaries().unwrap(), "returns the new listing");
+    let order = |l: &Library| l.dictionaries().unwrap().iter().map(|d| (d.position, d.id)).collect::<Vec<_>>();
+    assert_eq!(order(&library), [(0, untitled), (1, basic), (2, encrypted)]);
+
+    library.move_dictionary(untitled, 2).unwrap();
+    assert_eq!(order(&library), [(0, basic), (1, encrypted), (2, untitled)]);
+
+    library.move_dictionary(basic, 1).unwrap();
+    assert_eq!(order(&library), [(0, encrypted), (1, basic), (2, untitled)]);
+
+    // Past the end means last.
+    library.move_dictionary(encrypted, 99).unwrap();
+    assert_eq!(order(&library), [(0, basic), (1, untitled), (2, encrypted)]);
+}
+
+#[test]
+fn article_sections_follow_a_changed_order() {
+    let (_dir, mut library, first, second) = two_basic_dictionaries();
+    library.move_dictionary(second.id, 0).unwrap();
+    assert_eq!(section_ids(&library, "bank"), [second.id, first.id]);
+}
+
+#[test]
+fn new_dictionaries_go_last_after_a_reorder() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+    add(&mut library, "encrypted/encrypted.mdx");
+    library.move_dictionary(basic.id, 1).unwrap();
+    assert_eq!(add(&mut library, "untitled/untitled.mdx").position, 2);
+    assert_eq!(
+        titles_in_order(&library),
+        [(0, "encrypted".into()), (1, "Basic Test Dictionary".into()), (2, "untitled".into())]
+    );
+}
+
+#[test]
+fn order_persists_across_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    {
+        let mut library = Library::open(&db).unwrap();
+        add(&mut library, "basic/basic.mdx");
+        let untitled = add(&mut library, "untitled/untitled.mdx");
+        library.move_dictionary(untitled.id, 0).unwrap();
+    }
+    assert_eq!(
+        titles_in_order(&Library::open(&db).unwrap()),
+        [(0, "untitled".into()), (1, "Basic Test Dictionary".into())]
+    );
+}
+
+#[test]
+fn moving_an_unknown_dictionary_is_an_error() {
+    let (_dir, mut library, _) = three_dictionaries();
+    let error = library.move_dictionary(DictionaryId::from_raw(99), 0).unwrap_err();
+    assert_eq!(error.to_string(), "no dictionary with id 99 in the library");
+}
+
+#[test]
+fn renaming_changes_the_display_name_everywhere() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+    assert_eq!(basic.file_title, "Basic Test Dictionary");
+
+    let renamed = library.rename(basic.id, "  Basic  ").unwrap();
+    assert_eq!(
+        renamed,
+        DictionaryInfo { title: "Basic".into(), ..basic.clone() },
+        "trimmed; the file's own title is kept"
+    );
+    assert_eq!(library.dictionaries().unwrap(), [renamed]);
+    assert_eq!(library.article("go").unwrap().sections[0].dictionary_title, "Basic");
+}
+
+#[test]
+fn an_empty_name_restores_the_file_title() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+    library.rename(basic.id, "Basic").unwrap();
+    assert_eq!(library.rename(basic.id, " ").unwrap(), basic);
+    library.rename(basic.id, "Basic").unwrap();
+    assert_eq!(library.rename(basic.id, "").unwrap(), basic);
+}
+
+#[test]
+fn a_rename_persists_across_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    let renamed = {
+        let mut library = Library::open(&db).unwrap();
+        let id = add(&mut library, "encrypted/encrypted.mdx").id;
+        library.rename(id, "Locked").unwrap()
+    };
+    assert_eq!(renamed.title, "Locked", "unusable dictionaries can be renamed too");
+    assert_eq!(Library::open(&db).unwrap().dictionaries().unwrap(), [renamed]);
+}
+
+#[test]
+fn renaming_an_unknown_dictionary_is_an_error() {
+    let (_dir, mut library) = new_library();
+    let error = library.rename(DictionaryId::from_raw(5), "x").unwrap_err();
+    assert_eq!(error.to_string(), "no dictionary with id 5 in the library");
+}
+
+#[test]
+fn removing_a_dictionary_takes_it_out_of_everything() {
+    let (_dir, mut library, first, second) = two_basic_dictionaries();
+    let untitled = add(&mut library, "untitled/untitled.mdx");
+
+    let listed = library.remove(first.id).unwrap();
+    assert_eq!(listed, library.dictionaries().unwrap(), "returns the new listing");
+    let order: Vec<_> = listed.iter().map(|d| (d.position, d.id)).collect();
+    assert_eq!(order, [(0, second.id), (1, untitled.id)], "the rest close up");
+    assert_eq!(section_ids(&library, "bank"), [second.id]);
+    assert_eq!(library.resource(first.id, "basic.css").unwrap(), None);
+
+    library.remove(second.id).unwrap();
+    assert_eq!(search_all(&library, ""), ["nameless"]);
+    assert_eq!(library.article("bank").unwrap(), Article { sections: vec![] });
+}
+
+#[test]
+fn a_removed_dictionary_can_be_added_again() {
+    let (_dir, mut library) = new_library();
+    let basic = add(&mut library, "basic/basic.mdx");
+    library.rename(basic.id, "Basic").unwrap();
+    library.remove(basic.id).unwrap();
+    assert_eq!(library.dictionaries().unwrap(), []);
+
+    let again = add(&mut library, "basic/basic.mdx");
+    assert_eq!((again.title.as_str(), again.position), ("Basic Test Dictionary", 0));
+    assert_eq!(search_all(&library, "go"), ["go"]);
+    assert_eq!(entries(&library, "bank").len(), 2, "headwords not doubled");
+}
+
+#[test]
+fn removing_leaves_the_file_alone() {
+    let (dir, mut library) = new_library();
+    let basic = add_copy(&mut library, dir.path(), "dicts", "basic/basic.mdx");
+    library.remove(basic.id).unwrap();
+    assert!(dir.path().join("dicts/basic.mdx").is_file());
+    assert!(dir.path().join("dicts/basic.mdd").is_file());
+}
+
+#[test]
+fn removal_persists_across_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    {
+        let mut library = Library::open(&db).unwrap();
+        let basic = add(&mut library, "basic/basic.mdx");
+        add(&mut library, "untitled/untitled.mdx");
+        library.remove(basic.id).unwrap();
+    }
+    let library = Library::open(&db).unwrap();
+    assert_eq!(titles_in_order(&library), [(0, "untitled".into())]);
+    assert_eq!(library.search("", 0, 0).unwrap().total_count, 1);
+}
+
+#[test]
+fn removing_an_unknown_dictionary_is_an_error() {
+    let (_dir, mut library) = basic_library();
+    let error = library.remove(DictionaryId::from_raw(42)).unwrap_err();
+    assert_eq!(error.to_string(), "no dictionary with id 42 in the library");
+    assert_eq!(library.dictionaries().unwrap().len(), 1);
+}
+
+#[test]
+fn enabled_flag_persists_across_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    {
+        let mut library = Library::open(&db).unwrap();
+        let id = add(&mut library, "basic/basic.mdx").id;
+        library.set_enabled(id, false).unwrap();
+    }
+    let library = Library::open(&db).unwrap();
+    assert!(!library.dictionaries().unwrap()[0].enabled);
+    assert_eq!(search_all(&library, "go"), [] as [&str; 0]);
 }

@@ -136,3 +136,43 @@ fn set_allow_scripts_returns_the_updated_dictionary() {
         .unwrap_err();
     assert_eq!(error, "no dictionary with id 999 in the library");
 }
+
+#[test]
+fn dictionaries_lists_the_library_in_order() {
+    let app = TestApp::new();
+    assert_eq!(app.invoke("dictionaries", json!({})).unwrap(), json!([]));
+    let basic = app.add("basic/basic.mdx");
+    let encrypted = app.add("encrypted/encrypted.mdx");
+    assert_eq!(app.invoke("dictionaries", json!({})).unwrap(), json!([basic, encrypted]));
+    assert_eq!(basic["fileTitle"], "Basic Test Dictionary");
+}
+
+#[test]
+fn library_management_commands() {
+    let app = TestApp::new();
+    let basic = app.add("basic/basic.mdx");
+    let id = basic["id"].clone();
+    let untitled_id = app.add("untitled/untitled.mdx")["id"].clone();
+
+    let info = app.invoke("set_enabled", json!({ "dictionaryId": id, "enabled": false })).unwrap();
+    assert_eq!(info["enabled"], false);
+    let page = app.invoke("search", json!({ "query": "go", "offset": 0, "limit": 10 })).unwrap();
+    assert_eq!(page["totalCount"], 0);
+
+    let info = app.invoke("rename_dictionary", json!({ "dictionaryId": id, "name": "Mine" })).unwrap();
+    assert_eq!((&info["title"], &info["fileTitle"]), (&json!("Mine"), &json!("Basic Test Dictionary")));
+
+    let listed = app
+        .invoke("move_dictionary", json!({ "dictionaryId": untitled_id, "position": 0 }))
+        .unwrap();
+    let order: Vec<_> = listed.as_array().unwrap().iter().map(|d| d["id"].clone()).collect();
+    assert_eq!(order, [untitled_id.clone(), id.clone()]);
+
+    let listed = app.invoke("remove_dictionary", json!({ "dictionaryId": untitled_id })).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], id);
+    assert_eq!(listed[0]["position"], 0);
+
+    let error = app.invoke("remove_dictionary", json!({ "dictionaryId": 999 })).unwrap_err();
+    assert_eq!(error, "no dictionary with id 999 in the library");
+}

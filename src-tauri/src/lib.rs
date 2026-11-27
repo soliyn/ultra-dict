@@ -64,5 +64,10 @@ pub fn with_commands<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         commands::search,
         commands::article,
         commands::set_allow_scripts,
+        commands::dictionaries,
+        commands::set_enabled,
+        commands::rename_dictionary,
+        commands::move_dictionary,
+        commands::remove_dictionary,
     ])
 }

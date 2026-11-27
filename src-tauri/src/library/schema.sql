@@ -1,4 +1,4 @@
--- Library database, schema version 2 (PRAGMA user_version).
+-- Library database, schema version 3 (PRAGMA user_version).
 --
 -- This file creates the latest schema on a new database. Upgrades of
 -- existing ones are the MIGRATIONS in mod.rs: change both together.
@@ -13,7 +13,11 @@ CREATE TABLE dictionaries (
     -- Absolute path of the dictionary file, referenced in place.
     path          TEXT    NOT NULL UNIQUE,
     -- Display title read from the file (HTML stripped, falls back to the file name).
+    -- Reindexing rewrites it.
     title         TEXT    NOT NULL,
+    -- The user's rename, shown instead of `title` (NULL if none). Reindexing
+    -- never touches it.
+    user_title    TEXT,
     -- Library order: drives article order in lookups. 0 is first.
     position      INTEGER NOT NULL,
     enabled       INTEGER NOT NULL DEFAULT 1,

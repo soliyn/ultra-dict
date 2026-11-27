@@ -6,7 +6,10 @@ import { invoke } from "@tauri-apps/api/core";
 export interface DictionaryInfo {
   id: number;
   path: string;
+  /** Display name: the user's rename, else `fileTitle`. */
   title: string;
+  /** The title read from the file. */
+  fileTitle: string;
   position: number;
   enabled: boolean;
   status: "ready" | "error";
@@ -52,4 +55,28 @@ export function article(headword: string): Promise<Article> {
 
 export function setAllowScripts(dictionaryId: number, allow: boolean): Promise<DictionaryInfo> {
   return invoke("set_allow_scripts", { dictionaryId, allow });
+}
+
+/** Every dictionary, in library order. */
+export function dictionaries(): Promise<DictionaryInfo[]> {
+  return invoke("dictionaries");
+}
+
+export function setEnabled(dictionaryId: number, enabled: boolean): Promise<DictionaryInfo> {
+  return invoke("set_enabled", { dictionaryId, enabled });
+}
+
+/** An empty `name` restores the file's title. */
+export function renameDictionary(dictionaryId: number, name: string): Promise<DictionaryInfo> {
+  return invoke("rename_dictionary", { dictionaryId, name });
+}
+
+/** Resolves to the new listing. */
+export function moveDictionary(dictionaryId: number, position: number): Promise<DictionaryInfo[]> {
+  return invoke("move_dictionary", { dictionaryId, position });
+}
+
+/** Resolves to the new listing. The file itself is left alone. */
+export function removeDictionary(dictionaryId: number): Promise<DictionaryInfo[]> {
+  return invoke("remove_dictionary", { dictionaryId });
 }
