@@ -169,3 +169,130 @@ fn library_persists_across_reopening() {
     let reopened = Library::open(&db).unwrap();
     assert_eq!(reopened.dictionaries().unwrap(), added);
 }
+
+// --- search ---------------------------------------------------------------
+
+/// Every distinct headword of `basic.mdx`, in case-insensitive order.
+const BASIC_SORTED: &[&str] = &[
+    "bank", "chain0", "chain1", "chain2", "chain3", "chain4", "chain5", "chain6", "go", "hello",
+    "ping", "Polish", "polish", "pong", "resume", "résumé", "self", "went",
+];
+
+fn basic_library() -> (TempDir, Library) {
+    let (dir, mut library) = new_library();
+    add(&mut library, "basic/basic.mdx");
+    (dir, library)
+}
+
+/// All results for `query`, in one page.
+fn search_all(library: &Library, query: &str) -> Vec<String> {
+    let page = library.search(query, 0, 1000).unwrap();
+    assert_eq!(page.total_count, page.items.len() as u64, "{query:?}");
+    page.items
+}
+
+#[test]
+fn search_ignores_case_and_diacritics() {
+    let (_dir, library) = basic_library();
+    assert_eq!(search_all(&library, "resume"), ["resume", "résumé"]);
+    assert_eq!(search_all(&library, "RÉSU"), ["resume", "résumé"]);
+    assert_eq!(search_all(&library, "Res"), ["resume", "résumé"]);
+    assert_eq!(search_all(&library, "e\u{301}"), [] as [&str; 0], "no headword starts with é");
+}
+
+#[test]
+fn search_is_a_prefix_match() {
+    let (_dir, library) = basic_library();
+    assert_eq!(search_all(&library, "p"), ["ping", "Polish", "polish", "pong"]);
+    assert_eq!(search_all(&library, "chain6"), ["chain6"]);
+    assert_eq!(search_all(&library, "ell"), [] as [&str; 0], "no infix matches");
+}
+
+#[test]
+fn search_keeps_case_variants_as_separate_rows() {
+    let (_dir, library) = basic_library();
+    assert_eq!(search_all(&library, "pol"), ["Polish", "polish"]);
+}
+
+#[test]
+fn exact_case_match_sorts_first() {
+    let (_dir, library) = basic_library();
+    assert_eq!(search_all(&library, "Polish"), ["Polish", "polish"]);
+    assert_eq!(search_all(&library, "polish"), ["polish", "Polish"]);
+    assert_eq!(search_all(&library, "résumé"), ["résumé", "resume"]);
+    // No exact spelling: plain case-insensitive order.
+    assert_eq!(search_all(&library, "POLISH"), ["Polish", "polish"]);
+}
+
+#[test]
+fn search_returns_one_row_per_spelling() {
+    // `bank` has two entries in `basic.mdx`; a second copy of the dictionary
+    // repeats every headword in another dictionary.
+    let (dir, mut library) = basic_library();
+    let copy = dir.path().join("copy/basic-copy.mdx");
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
+    assert_eq!(library.add_file(&copy).unwrap().status, Status::Ready);
+
+    assert_eq!(search_all(&library, "bank"), ["bank"]);
+    assert_eq!(search_all(&library, ""), BASIC_SORTED);
+}
+
+#[test]
+fn empty_query_pages_from_the_start_of_the_index() {
+    let (_dir, library) = basic_library();
+    let page = library.search("", 0, 3).unwrap();
+    assert_eq!(page.items, ["bank", "chain0", "chain1"]);
+    assert_eq!(page.total_count, BASIC_SORTED.len() as u64);
+}
+
+#[test]
+fn search_pages_concatenate_to_the_full_result() {
+    let (_dir, library) = basic_library();
+    for query in ["", "p", "polish", "Polish", "résumé", "chain", "go"] {
+        let full = search_all(&library, query);
+        for page_size in 1..=4 {
+            let mut joined = Vec::new();
+            for offset in (0..full.len() + page_size).step_by(page_size) {
+                let page = library.search(query, offset, page_size).unwrap();
+                assert_eq!(page.total_count, full.len() as u64, "{query:?} @{offset}");
+                assert!(page.items.len() <= page_size);
+                joined.extend(page.items);
+            }
+            assert_eq!(joined, full, "{query:?} in pages of {page_size}");
+        }
+    }
+}
+
+#[test]
+fn search_with_zero_limit_still_counts() {
+    let (_dir, library) = basic_library();
+    let page = library.search("polish", 0, 0).unwrap();
+    assert_eq!(page.items, [] as [&str; 0]);
+    assert_eq!(page.total_count, 2);
+}
+
+#[test]
+fn search_without_matches_is_empty() {
+    let (_dir, library) = basic_library();
+    let page = library.search("zzz", 0, 50).unwrap();
+    assert_eq!(page.items, [] as [&str; 0]);
+    assert_eq!(page.total_count, 0);
+}
+
+#[test]
+fn search_covers_every_ready_dictionary_and_skips_failed_ones() {
+    let (_dir, mut library) = new_library();
+    add(&mut library, "basic/basic.mdx");
+    add(&mut library, "untitled/untitled.mdx");
+    add(&mut library, "damaged/damaged.mdx");
+    assert_eq!(search_all(&library, "n"), ["nameless"]);
+    assert_eq!(search_all(&library, "alpha"), [] as [&str; 0], "damaged is not searchable");
+    assert_eq!(library.search("", 0, 0).unwrap().total_count, 19);
+}
+
+#[test]
+fn search_on_an_empty_library_is_empty() {
+    let (_dir, library) = new_library();
+    assert_eq!(library.search("", 0, 10).unwrap().total_count, 0);
+}

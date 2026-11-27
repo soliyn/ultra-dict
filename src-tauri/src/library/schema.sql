@@ -35,7 +35,9 @@ CREATE TABLE headwords (
     locator       INTEGER NOT NULL
 );
 
-CREATE INDEX headwords_by_folded ON headwords (folded, headword);
+-- Search: prefix range on `folded`, rows already in result order, and
+-- covering (dictionary_id included) so matching never touches the table.
+CREATE INDEX headwords_by_folded ON headwords (folded, headword, dictionary_id);
 CREATE INDEX headwords_by_dictionary ON headwords (dictionary_id);
 
 -- Recent lookups, newest last.

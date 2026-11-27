@@ -101,6 +101,76 @@ impl Library {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Headwords whose folded form starts with the folded `query`, across
+    /// every enabled, ready dictionary: one row per distinct spelling.
+    ///
+    /// A headword spelled exactly like `query` comes first. The rest are in
+    /// case- and diacritic-insensitive order; spellings that fold alike are
+    /// ordered by code point (`Polish` before `polish`). An empty query
+    /// matches everything, paging through the whole index from the start.
+    pub fn search(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SearchPage, LibraryError> {
+        let folded = fold(query);
+        // Every key starting with `folded` sorts below this bound: U+10FFFF
+        // is the largest code point (and a noncharacter, absent from text).
+        let upper = format!("{folded}\u{10FFFF}");
+
+        let exact = !query.is_empty()
+            && self
+                .db
+                .prepare_cached(&format!(
+                    "SELECT EXISTS (SELECT 1 FROM headwords h
+                     WHERE h.folded = ?1 AND h.headword = ?2 AND {SEARCHABLE})"
+                ))?
+                .query_row(params![folded, query], |row| row.get::<_, bool>(0))?;
+
+        // The exact match is row 0; the other matches follow in index order,
+        // which needs no sort however many rows match.
+        let mut items = Vec::with_capacity(limit.min(1000));
+        let (rest_offset, rest_limit) = match (exact, offset) {
+            (true, 0) => {
+                if limit > 0 {
+                    items.push(query.to_owned());
+                }
+                (0, limit.saturating_sub(1))
+            }
+            (true, _) => (offset - 1, limit),
+            (false, _) => (offset, limit),
+        };
+
+        // One row per spelling in the folded prefix range `?1..?2`, except
+        // the exact spelling `?3`, grouped in index order.
+        let other_matches = format!(
+            "FROM headwords h
+             WHERE h.folded >= ?1 AND h.folded < ?2 AND h.headword <> ?3 AND {SEARCHABLE}
+             GROUP BY h.folded, h.headword"
+        );
+        let rest_count: i64 = self
+            .db
+            .prepare_cached(&format!("SELECT COUNT(*) FROM (SELECT 1 {other_matches})"))?
+            .query_row(params![folded, upper, query], |row| row.get(0))?;
+
+        let mut page = self.db.prepare_cached(&format!(
+            "SELECT h.headword {other_matches} ORDER BY h.folded, h.headword LIMIT ?4 OFFSET ?5"
+        ))?;
+        let rows = page.query_map(
+            params![folded, upper, query, to_sql_int(rest_limit), to_sql_int(rest_offset)],
+            |row| row.get::<_, String>(0),
+        )?;
+        for row in rows {
+            items.push(row?);
+        }
+
+        Ok(SearchPage {
+            items,
+            total_count: rest_count as u64 + u64::from(exact),
+        })
+    }
+
     fn get(&self, id: DictionaryId) -> Result<DictionaryInfo, LibraryError> {
         let mut stmt = self.db.prepare_cached(&format!("{SELECT_INFO} WHERE d.id = ?1"))?;
         Ok(stmt.query_row([id.0], DictionaryInfo::from_row)?)
@@ -188,6 +258,27 @@ fn insert_dictionary(
         ],
     )?;
     Ok(DictionaryId(tx.last_insert_rowid()))
+}
+
+/// SQL condition: headword row `h` belongs to a searchable dictionary.
+///
+/// The unary `+` stops SQLite from driving the query by the
+/// `headwords_by_dictionary` index (a full scan plus sort); search must
+/// walk the `folded` range of `headwords_by_folded` instead.
+const SEARCHABLE: &str =
+    "+h.dictionary_id IN (SELECT id FROM dictionaries WHERE enabled AND status = 'ready')";
+
+fn to_sql_int(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// One page of [`Library::search`] results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage {
+    /// Headwords on this page, in result order.
+    pub items: Vec<String>,
+    /// Number of matching headwords across all pages.
+    pub total_count: u64,
 }
 
 const SELECT_INFO: &str = "
