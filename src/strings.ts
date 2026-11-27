@@ -24,4 +24,6 @@ export const strings = {
   allowScripts: "Allow scripts",
   allowScriptsHint: "Run this dictionary's own JavaScript in its articles, isolated from the app.",
   settingFailed: (message: string) => `Couldn't change the setting: ${message}`,
+  soundNotFound: (path: string) => `Sound not found: ${path}`,
+  soundUnsupported: (path: string) => `Can't play this format: ${path}`,
 } as const;
