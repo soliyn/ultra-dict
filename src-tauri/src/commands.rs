@@ -74,6 +74,21 @@ pub async fn reindex_dictionary(
     info
 }
 
+/// Points a dictionary (one whose file went missing, say) at another file
+/// and indexes it from there in the background, keeping its settings.
+#[tauri::command]
+pub async fn relocate_dictionary(
+    library: State<'_, SharedLibrary>,
+    indexer: State<'_, IndexerHandle>,
+    dictionary_id: i64,
+    path: PathBuf,
+) -> Result<DictionaryInfo, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    let info = with_library(&library, |lib| lib.relocate(id, &path)).map(DictionaryInfo::from);
+    indexer.wake();
+    info
+}
+
 /// Stops indexing a dictionary; it is left needing reindexing.
 #[tauri::command]
 pub async fn cancel_indexing(
@@ -211,7 +226,7 @@ pub struct DictionaryInfo {
     pub file_title: String,
     pub position: u32,
     pub enabled: bool,
-    /// `"indexing"`, `"ready"`, `"needs_reindex"` or `"error"`.
+    /// `"indexing"`, `"ready"`, `"needs_reindex"`, `"missing"` or `"error"`.
     pub status: &'static str,
     /// Why the dictionary can't be used, when `status` is `"error"`.
     pub error: Option<String>,
@@ -225,6 +240,7 @@ impl From<library::DictionaryInfo> for DictionaryInfo {
             library::Status::Indexing => ("indexing", None),
             library::Status::Ready => ("ready", None),
             library::Status::NeedsReindex => ("needs_reindex", None),
+            library::Status::Missing => ("missing", None),
             library::Status::Error(message) => ("error", Some(message)),
         };
         Self {

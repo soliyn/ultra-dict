@@ -42,6 +42,7 @@ export const strings = {
   statusIndexing: (done: number, total: number) =>
     `Indexing… ${total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : 0}%`,
   statusNeedsReindex: "Not indexed: indexing was stopped",
+  statusMissing: (path: string) => `File not found: ${path}`,
   statusDisabled: (status: string) => `Disabled · ${status}`,
   statusError: (message: string) => `Error: ${message}`,
   originalTitle: (title: string) => `Title in the file: ${title}`,
@@ -49,6 +50,8 @@ export const strings = {
   stopIndexingHint: "Stop indexing this dictionary. You can reindex it later.",
   reindex: "Reindex",
   reindexHint: "Read the dictionary file again.",
+  relocate: "Re-locate…",
+  relocateHint: "Choose where the dictionary file is now. Its name and settings are kept.",
   rename: "Rename",
   renameLabel: "New name",
   renameHint: "Leave empty to use the title from the file.",

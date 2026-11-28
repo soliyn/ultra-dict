@@ -115,6 +115,21 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
       return scanNotice(await api.addFolder(path));
     });
 
+  const relocate = async (d: api.DictionaryInfo) => {
+    let path: string | null;
+    try {
+      path = await open({
+        multiple: false,
+        directory: false,
+        filters: [{ name: strings.dictionaryFilter, extensions: ["mdx"] }],
+      });
+    } catch (e) {
+      failed(strings.libraryChangeFailed(String(e)));
+      return;
+    }
+    if (path !== null) await change(() => api.relocateDictionary(d.id, path));
+  };
+
   const rescan = (folder: api.FolderInfo) =>
     add(folder.id, async () => scanNotice(await api.rescanFolder(folder.id)));
 
@@ -196,6 +211,7 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
             onEnabled={(enabled) => change(() => api.setEnabled(d.id, enabled))}
             onReindex={() => change(() => api.reindexDictionary(d.id))}
             onStopIndexing={() => change(() => api.cancelIndexing(d.id))}
+            onRelocate={() => void relocate(d)}
             onMove={(position) => change(() => api.moveDictionary(d.id, position))}
             onRename={(name) => change(() => api.renameDictionary(d.id, name))}
             onRemove={() => change(() => api.removeDictionary(d.id))}
@@ -229,6 +245,7 @@ interface RowProps {
   onEnabled(enabled: boolean): void;
   onReindex(): void;
   onStopIndexing(): void;
+  onRelocate(): void;
   onMove(position: number): void;
   /** Resolves to whether the rename succeeded. */
   onRename(name: string): Promise<boolean>;
@@ -237,7 +254,7 @@ interface RowProps {
 
 function DictionaryRow(props: RowProps) {
   const { dictionary: d, index, last, busy, progress, onEnabled, onReindex, onStopIndexing } = props;
-  const { onMove, onRename, onRemove } = props;
+  const { onRelocate, onMove, onRename, onRemove } = props;
   // The name being typed, while renaming.
   const [draft, setDraft] = useState<string | null>(null);
   const [confirmingRemove, setConfirmingRemove] = useState(false);
@@ -286,12 +303,17 @@ function DictionaryRow(props: RowProps) {
             </button>
           </form>
         )}
-        <div className={"library-status" + (d.status === "error" ? " error" : "")}>{d.enabled ? status : strings.statusDisabled(status)}</div>
+        <div className={"library-status" + (d.status === "error" || d.status === "missing" ? " error" : "")}>{d.enabled ? status : strings.statusDisabled(status)}</div>
       </div>
       <div className="library-actions">
         {d.status === "indexing" && (
           <button className="button" onClick={onStopIndexing} disabled={busy} title={strings.stopIndexingHint}>
             {strings.stopIndexing}
+          </button>
+        )}
+        {d.status === "missing" && (
+          <button className="button" onClick={onRelocate} disabled={busy} title={strings.relocateHint}>
+            {strings.relocate}
           </button>
         )}
         {(d.status === "needs_reindex" || d.status === "error") && (
@@ -351,6 +373,8 @@ function statusText(d: api.DictionaryInfo, progress: api.IndexingEvent | undefin
       return strings.statusReady(d.headwordCount);
     case "needs_reindex":
       return strings.statusNeedsReindex;
+    case "missing":
+      return strings.statusMissing(d.path);
     case "error":
       return strings.statusError(d.error ?? "");
   }

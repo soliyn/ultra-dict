@@ -26,7 +26,8 @@ CREATE TABLE dictionaries (
     file_size     INTEGER,
     file_mtime_ns INTEGER,
     -- 'indexing' (waiting for or being indexed, not searchable), 'ready',
-    -- 'needs_reindex' (indexing cancelled or interrupted) or 'error'.
+    -- 'needs_reindex' (indexing cancelled or interrupted), 'missing' (the
+    -- file was gone at the startup check; no headwords) or 'error'.
     status        TEXT    NOT NULL,
     -- Human-readable reason when status is 'error'.
     error         TEXT,
