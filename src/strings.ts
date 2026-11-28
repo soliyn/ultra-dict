@@ -13,7 +13,18 @@ export const strings = {
     count === 1 ? "1 match" : `${count.toLocaleString("en")} matches`,
   noSelection: "Select a word to see its article.",
   addFile: "Add file…",
+  addFolder: "Add folder…",
   adding: "Adding…",
+  scanning: "Scanning…",
+  folders: "Folders",
+  rescan: "Rescan",
+  rescanHint: "Add the dictionaries placed in this folder since it was last scanned.",
+  forgetFolder: "Forget",
+  forgetFolderHint: "Stop offering this folder for rescanning. Its dictionaries stay in the library.",
+  scanAdded: (added: number, unusable: number) =>
+    (added === 1 ? "Added 1 dictionary" : `Added ${added.toLocaleString("en")} dictionaries`) +
+    (unusable === 0 ? "." : ` (${unusable.toLocaleString("en")} can't be used).`),
+  scanFoundNothing: (path: string) => `No new dictionaries in ${path}.`,
   dictionaryFilter: "MDict dictionaries",
   addFailed: (message: string) => `Couldn't add the dictionary: ${message}`,
   dictionaryUnusable: (title: string, message: string) => `${title} can't be used: ${message}`,

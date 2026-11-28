@@ -29,6 +29,8 @@ unicode-normalization = "0.1.26"
 tauri-plugin-dialog = "2"
 # Decodes `dict://` resource URLs (src/protocol.rs).
 percent-encoding = "2"
+# Canonical paths without the `\\?\` prefix on Windows (src/library/mod.rs).
+dunce = "1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

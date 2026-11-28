@@ -148,6 +148,39 @@ fn dictionaries_lists_the_library_in_order() {
 }
 
 #[test]
+fn folder_commands() {
+    let app = TestApp::new();
+    assert_eq!(app.invoke("folders", json!({})).unwrap(), json!([]));
+
+    let scan = app.invoke("add_folder", json!({ "path": fixture("multivolume") })).unwrap();
+    let folder = scan["folder"].clone();
+    assert!(folder["id"].is_i64(), "{scan}");
+    assert_eq!(
+        std::fs::canonicalize(folder["path"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(fixture("multivolume")).unwrap()
+    );
+    let added = scan["added"].as_array().unwrap();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0]["title"], "Multi-volume Test Dictionary");
+    assert_eq!(added[0]["status"], "ready");
+    assert_eq!(app.invoke("folders", json!({})).unwrap(), json!([folder]));
+
+    let rescan = app.invoke("rescan_folder", json!({ "folderId": folder["id"] })).unwrap();
+    assert_eq!(rescan, json!({ "folder": folder, "added": [] }));
+
+    let error = app.invoke("rescan_folder", json!({ "folderId": 999 })).unwrap_err();
+    assert_eq!(error, "no folder with id 999 in the library");
+    let error = app
+        .invoke("add_folder", json!({ "path": fixture("no-such-folder") }))
+        .unwrap_err();
+    assert!(error.as_str().unwrap().starts_with("cannot read folder"), "{error}");
+
+    let remaining = app.invoke("remove_folder", json!({ "folderId": folder["id"] })).unwrap();
+    assert_eq!(remaining, json!([]));
+    assert_eq!(app.invoke("dictionaries", json!({})).unwrap().as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn library_management_commands() {
     let app = TestApp::new();
     let basic = app.add("basic/basic.mdx");

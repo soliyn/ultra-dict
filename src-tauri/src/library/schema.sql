@@ -1,4 +1,4 @@
--- Library database, schema version 3 (PRAGMA user_version).
+-- Library database, schema version 4 (PRAGMA user_version).
 --
 -- This file creates the latest schema on a new database. Upgrades of
 -- existing ones are the MIGRATIONS in mod.rs: change both together.
@@ -10,7 +10,8 @@
 -- One row per dictionary file the user added.
 CREATE TABLE dictionaries (
     id            INTEGER PRIMARY KEY,
-    -- Absolute path of the dictionary file, referenced in place.
+    -- Absolute path of the dictionary file, referenced in place; canonical
+    -- (see `normalize` in mod.rs) if the file existed when it was added.
     path          TEXT    NOT NULL UNIQUE,
     -- Display title read from the file (HTML stripped, falls back to the file name).
     -- Reindexing rewrites it.
@@ -30,6 +31,15 @@ CREATE TABLE dictionaries (
     error         TEXT,
     -- Whether the dictionary's own JavaScript may run in its articles.
     allow_scripts INTEGER NOT NULL DEFAULT 0
+);
+
+-- Folders the user added, remembered so they can be rescanned. Dictionaries
+-- found in them are ordinary rows in `dictionaries`; forgetting a folder
+-- leaves them in place.
+CREATE TABLE folders (
+    id   INTEGER PRIMARY KEY,
+    -- Canonical absolute path of the folder.
+    path TEXT    NOT NULL UNIQUE
 );
 
 -- Every headword of every successfully indexed dictionary.

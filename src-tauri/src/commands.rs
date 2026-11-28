@@ -6,15 +6,16 @@
 //! `invoke`.
 //!
 //! The commands are `async` so that Tauri runs them off the main thread and
-//! a long `add_file` does not freeze the window. Indexing still blocks other
-//! commands until it finishes; background indexing is a later step.
+//! a long `add_file` or `add_folder` does not freeze the window. Indexing
+//! still blocks other commands until it finishes; background indexing is a
+//! later step.
 
 use std::path::PathBuf;
 
 use serde::Serialize;
 use tauri::State;
 
-use crate::library::{self, DictionaryId, Library, LibraryError};
+use crate::library::{self, DictionaryId, FolderId, Library, LibraryError};
 use crate::{SharedLibrary, lock_library};
 
 /// Adds one dictionary file. A file that can't be used is still added, with
@@ -25,6 +26,42 @@ pub async fn add_file(
     path: PathBuf,
 ) -> Result<DictionaryInfo, String> {
     with_library(&library, |lib| lib.add_file(&path)).map(DictionaryInfo::from)
+}
+
+/// Adds every dictionary in a folder (recursively) and remembers the folder.
+/// Rejects if the folder can't be read.
+#[tauri::command]
+pub async fn add_folder(
+    library: State<'_, SharedLibrary>,
+    path: PathBuf,
+) -> Result<FolderScan, String> {
+    with_library(&library, |lib| lib.add_folder(&path)).map(FolderScan::from)
+}
+
+/// Adds the dictionaries placed in a remembered folder since it was scanned.
+#[tauri::command]
+pub async fn rescan_folder(
+    library: State<'_, SharedLibrary>,
+    folder_id: i64,
+) -> Result<FolderScan, String> {
+    let id = FolderId::from_raw(folder_id);
+    with_library(&library, |lib| lib.rescan_folder(id)).map(FolderScan::from)
+}
+
+/// Every remembered folder.
+#[tauri::command]
+pub async fn folders(library: State<'_, SharedLibrary>) -> Result<Vec<FolderInfo>, String> {
+    with_library(&library, |lib| lib.folders()).map(folder_list)
+}
+
+/// Forgets a folder (its dictionaries stay); returns the remaining folders.
+#[tauri::command]
+pub async fn remove_folder(
+    library: State<'_, SharedLibrary>,
+    folder_id: i64,
+) -> Result<Vec<FolderInfo>, String> {
+    let id = FolderId::from_raw(folder_id);
+    with_library(&library, |lib| lib.remove_folder(id)).map(folder_list)
 }
 
 /// One page of headwords matching `query`.
@@ -114,6 +151,10 @@ fn list(infos: Vec<library::DictionaryInfo>) -> Vec<DictionaryInfo> {
     infos.into_iter().map(DictionaryInfo::from).collect()
 }
 
+fn folder_list(folders: Vec<library::FolderInfo>) -> Vec<FolderInfo> {
+    folders.into_iter().map(FolderInfo::from).collect()
+}
+
 fn with_library<T>(
     library: &SharedLibrary,
     call: impl FnOnce(&mut Library) -> Result<T, LibraryError>,
@@ -159,6 +200,41 @@ impl From<library::DictionaryInfo> for DictionaryInfo {
             error,
             allow_scripts: info.allow_scripts,
             headword_count: info.headword_count,
+        }
+    }
+}
+
+/// A folder the user added.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderInfo {
+    pub id: i64,
+    pub path: String,
+}
+
+impl From<library::FolderInfo> for FolderInfo {
+    fn from(folder: library::FolderInfo) -> Self {
+        Self {
+            id: folder.id.to_raw(),
+            path: folder.path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// What adding or rescanning a folder did: `added` lists only the
+/// dictionaries new to the library.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderScan {
+    pub folder: FolderInfo,
+    pub added: Vec<DictionaryInfo>,
+}
+
+impl From<library::FolderScan> for FolderScan {
+    fn from(scan: library::FolderScan) -> Self {
+        Self {
+            folder: scan.folder.into(),
+            added: list(scan.added),
         }
     }
 }
