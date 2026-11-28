@@ -8,11 +8,16 @@
 //! layer, all headwords are enumerated, the first and last entries are
 //! fetched, and one resource referenced by the first few articles is looked
 //! up. Use it to accept a replacement reader against the manual reference set.
+//!
+//! `indexing_benchmark` times indexing the largest file found through the
+//! library.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ultra_dict_lib::format::{self, Dictionary};
+use ultra_dict_lib::library::{Library, Status};
 
 #[test]
 #[ignore = "needs ULTRA_DICT_REFERENCE_DIR"]
@@ -98,4 +103,56 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// The indexing benchmark (`docs/spec-v1.md`): indexes the largest
+/// dictionary file in the reference folder through the library, as the app
+/// does, and reports the time.
+///
+/// ```text
+/// ULTRA_DICT_REFERENCE_DIR=/path/to/dictionaries cargo test --release --test reference_set indexing_benchmark -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs ULTRA_DICT_REFERENCE_DIR"]
+fn indexing_benchmark() {
+    let dir = std::env::var_os("ULTRA_DICT_REFERENCE_DIR").expect("set ULTRA_DICT_REFERENCE_DIR");
+    let mut files = Vec::new();
+    collect(Path::new(&dir), &mut files);
+    let largest = files
+        .into_iter()
+        .max_by_key(|path| std::fs::metadata(path).map_or(0, |m| m.len()))
+        .expect("no dictionary files found");
+    let size_mb = std::fs::metadata(&largest).unwrap().len() as f64 / 1e6;
+
+    let db = tempfile::tempdir().unwrap();
+    let mut library = Library::open(&db.path().join("library.sqlite3")).unwrap();
+    let id = library.add_file(&largest).unwrap().id;
+    let mut indexer = library.indexer().unwrap();
+    let started = Instant::now();
+    let mut batches = 0u64;
+    indexer
+        .index_next(|_, _| {
+            batches += 1;
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    let info = library.dictionaries().unwrap().into_iter().find(|d| d.id == id).unwrap();
+    assert_eq!(info.status, Status::Ready, "{}", largest.display());
+    let db_mb = std::fs::read_dir(db.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.metadata().map_or(0, |m| m.len()))
+        .sum::<u64>() as f64
+        / 1e6;
+    let searched = Instant::now();
+    let page = library.search("a", 0, 100).unwrap();
+    println!(
+        "indexed {size_mb:.0} MB .mdx: {} headwords in {elapsed:.1?} ({batches} progress reports), \
+         database {db_mb:.0} MB; search \"a\" -> {} matches in {:.1?}",
+        info.headword_count,
+        page.total_count,
+        searched.elapsed()
+    );
 }

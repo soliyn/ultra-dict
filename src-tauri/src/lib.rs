@@ -6,9 +6,10 @@ pub mod protocol;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use tauri::{Builder, Manager, Runtime};
+use tauri::{AppHandle, Builder, Emitter, Manager, Runtime};
 
-use crate::library::Library;
+use crate::commands::{INDEXING_EVENT, IndexingEvent};
+use crate::library::{Library, LibraryError};
 
 /// The library as Tauri state, shared by the commands and the `dict` scheme.
 pub type SharedLibrary = Mutex<Library>;
@@ -48,14 +49,29 @@ pub fn run() {
             let library = Library::open(&path)
                 .map_err(|e| format!("cannot open the library at {}: {e}", path.display()))?;
             app.manage(Mutex::new(library));
+            start_indexer(app.handle()).map_err(|e| format!("cannot start indexing: {e}"))?;
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
+/// Starts the background indexer over the app's [`SharedLibrary`] (which
+/// must be managed already) and manages its handle, which the commands use
+/// to wake it. Its events go to every window as [`INDEXING_EVENT`].
+pub fn start_indexer<R: Runtime>(app: &AppHandle<R>) -> Result<(), LibraryError> {
+    let indexer = lock_library(&app.state::<SharedLibrary>()).indexer()?;
+    let emitter = app.clone();
+    let handle = indexer.spawn(move |event| {
+        // Nothing to do if no window listens any more.
+        let _ = emitter.emit(INDEXING_EVENT, IndexingEvent::from(event));
+    });
+    app.manage(handle);
+    Ok(())
+}
+
 /// Registers every frontend-callable command. The app's state must include
-/// a [`SharedLibrary`].
+/// a [`SharedLibrary`] and its indexer (see [`start_indexer`]).
 ///
 /// Adding a command: write it in [`commands`] and list it here.
 pub fn with_commands<R: Runtime>(builder: Builder<R>) -> Builder<R> {
@@ -63,6 +79,8 @@ pub fn with_commands<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         commands::add_file,
         commands::add_folder,
         commands::rescan_folder,
+        commands::reindex_dictionary,
+        commands::cancel_indexing,
         commands::folders,
         commands::remove_folder,
         commands::search,

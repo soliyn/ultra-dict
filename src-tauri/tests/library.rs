@@ -5,11 +5,15 @@
 //! also hold for any replacement of the format readers or storage behind it.
 
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use tempfile::TempDir;
 use ultra_dict_lib::library::{
-    Article, DictionaryId, DictionaryInfo, FolderId, Library, Resource, Status,
+    Article, DictionaryId, DictionaryInfo, FolderId, FolderScan, IndexEvent, Library, Progress,
+    Resource, Status,
 };
 
 fn fixture(rel: &str) -> PathBuf {
@@ -23,10 +27,52 @@ fn new_library() -> (TempDir, Library) {
     (dir, library)
 }
 
+/// Indexes every dictionary waiting, as the background indexer would.
+fn index_all(library: &Library) {
+    let mut indexer = library.indexer().expect("indexer");
+    while indexer.index_next(|_, _| ControlFlow::Continue(())).expect("index").is_some() {}
+}
+
+/// Dictionary `id` as the library lists it now.
+fn current(library: &Library, id: DictionaryId) -> DictionaryInfo {
+    let listed = library.dictionaries().unwrap();
+    listed.into_iter().find(|d| d.id == id).expect("in the library")
+}
+
+/// Adds the dictionary file at `path` and indexes it.
+fn add_path(library: &mut Library, path: &Path) -> DictionaryInfo {
+    let added = library
+        .add_file(path)
+        .unwrap_or_else(|e| panic!("add {}: {e}", path.display()));
+    index_all(library);
+    current(library, added.id)
+}
+
+/// Adds fixture `rel` and indexes it.
 fn add(library: &mut Library, rel: &str) -> DictionaryInfo {
-    library
-        .add_file(&fixture(rel))
-        .unwrap_or_else(|e| panic!("add {rel}: {e}"))
+    add_path(library, &fixture(rel))
+}
+
+/// Adds the folder at `path` and indexes what it found; `added` is listed
+/// as indexed.
+fn add_folder(library: &mut Library, path: &Path) -> FolderScan {
+    let scan = library
+        .add_folder(path)
+        .unwrap_or_else(|e| panic!("add folder {}: {e}", path.display()));
+    indexed(library, scan)
+}
+
+/// Rescans folder `id` and indexes what it found.
+fn rescan(library: &mut Library, id: FolderId) -> FolderScan {
+    let scan = library.rescan_folder(id).expect("rescan");
+    indexed(library, scan)
+}
+
+fn indexed(library: &Library, scan: FolderScan) -> FolderScan {
+    assert!(scan.added.iter().all(|d| d.status == Status::Indexing), "{:?}", scan.added);
+    index_all(library);
+    let added = scan.added.iter().map(|d| current(library, d.id)).collect();
+    FolderScan { added, ..scan }
 }
 
 #[test]
@@ -234,7 +280,7 @@ fn search_returns_one_row_per_spelling() {
     let copy = dir.path().join("copy/basic-copy.mdx");
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
-    assert_eq!(library.add_file(&copy).unwrap().status, Status::Ready);
+    assert_eq!(add_path(&mut library, &copy).status, Status::Ready);
 
     assert_eq!(search_all(&library, "bank"), ["bank"]);
     assert_eq!(search_all(&library, ""), BASIC_SORTED);
@@ -380,7 +426,7 @@ fn article_sections_follow_library_order() {
     let copy = dir.path().join("copy/basic-copy.mdx");
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
-    let second = library.add_file(&copy).unwrap();
+    let second = add_path(&mut library, &copy);
 
     let article = library.article("bank").unwrap();
     let ids: Vec<_> = article.sections.iter().map(|s| s.dictionary_id).collect();
@@ -397,7 +443,7 @@ fn unreadable_dictionary_reports_an_error_in_its_section() {
     let copy = dir.path().join("copy/basic-copy.mdx");
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
-    Library::open(&db).unwrap().add_file(&copy).unwrap();
+    add_path(&mut Library::open(&db).unwrap(), &copy);
     fs::remove_file(&copy).unwrap();
 
     let article = Library::open(&db).unwrap().article("go").unwrap();
@@ -437,7 +483,7 @@ fn add_copy(library: &mut Library, dir: &Path, sub: &str, rel: &str) -> Dictiona
             fs::copy(&path, folder.join(path.file_name().unwrap())).unwrap();
         }
     }
-    let info = library.add_file(&folder.join(from.file_name().unwrap())).unwrap();
+    let info = add_path(library, &folder.join(from.file_name().unwrap()));
     assert_eq!(info.status, Status::Ready);
     info
 }
@@ -578,7 +624,7 @@ fn allow_scripts_is_set_per_dictionary_and_shows_in_articles() {
     let copy = dir.path().join("copy/basic-copy.mdx");
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
-    let second = library.add_file(&copy).unwrap();
+    let second = add_path(&mut library, &copy);
 
     let updated = library.set_allow_scripts(first.id, true).unwrap();
     assert_eq!(updated, DictionaryInfo { allow_scripts: true, ..first.clone() });
@@ -650,12 +696,19 @@ fn an_old_library_is_upgraded_in_place() {
     assert_eq!(old.file_title, "Old");
     assert!(library.set_allow_scripts(old.id, true).unwrap().allow_scripts);
     assert_eq!(library.rename(old.id, "New").unwrap().title, "New");
-    let scan = library.add_folder(&fixture("untitled")).unwrap();
+    let scan = add_folder(&mut library, &fixture("untitled"));
     assert_eq!(scan.added.len(), 1, "folders work after the upgrade");
     drop(library);
     let reopened = Library::open(&db).unwrap().dictionaries().unwrap().remove(0);
     assert!(reopened.allow_scripts, "reopens");
     assert_eq!((reopened.title.as_str(), reopened.file_title.as_str()), ("New", "Old"));
+
+    let mut library = Library::open(&db).unwrap();
+    library.reindex(old.id).unwrap();
+    index_all(&library);
+    let reindexed = current(&library, old.id);
+    assert_eq!(reindexed.status, Status::Ready, "reindexing works after the upgrade");
+    assert_eq!((reindexed.title.as_str(), reindexed.headword_count), ("New", 19));
 }
 
 #[test]
@@ -679,7 +732,7 @@ fn two_basic_dictionaries() -> (TempDir, Library, DictionaryInfo, DictionaryInfo
     let copy = dir.path().join("copy/basic-copy.mdx");
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::copy(fixture("basic/basic.mdx"), &copy).unwrap();
-    let second = library.add_file(&copy).unwrap();
+    let second = add_path(&mut library, &copy);
     (dir, library, first, second)
 }
 
@@ -953,7 +1006,7 @@ fn adding_a_folder_adds_every_mdx_in_it_recursively() {
     let (dir, mut library) = new_library();
     let folder = dictionary_tree(dir.path());
 
-    let scan = library.add_folder(&folder).unwrap();
+    let scan = add_folder(&mut library, &folder);
     assert_eq!(
         titles(&scan.added),
         ["Basic Test Dictionary", "Multi-volume Test Dictionary", "untitled"],
@@ -972,7 +1025,7 @@ fn adding_a_folder_adds_every_mdx_in_it_recursively() {
 fn adding_a_folder_remembers_it() {
     let (dir, mut library) = new_library();
     let folder = dictionary_tree(dir.path());
-    let scan = library.add_folder(&folder).unwrap();
+    let scan = add_folder(&mut library, &folder);
     assert_eq!(library.folders().unwrap(), std::slice::from_ref(&scan.folder));
     assert_eq!(
         fs::canonicalize(&scan.folder.path).unwrap(),
@@ -989,7 +1042,7 @@ fn mdx_extension_matches_in_any_case() {
     let (dir, mut library) = new_library();
     fs::create_dir_all(dir.path().join("dicts")).unwrap();
     fs::copy(fixture("untitled/untitled.mdx"), dir.path().join("dicts/LOUD.MDX")).unwrap();
-    let scan = library.add_folder(&dir.path().join("dicts")).unwrap();
+    let scan = add_folder(&mut library, &dir.path().join("dicts"));
     assert_eq!(titles(&scan.added), ["LOUD"]);
 }
 
@@ -998,7 +1051,7 @@ fn unusable_dictionaries_in_a_folder_are_added_with_their_error() {
     let (dir, mut library) = new_library();
     copy_fixture_folder(dir.path(), "dicts", "encrypted");
     copy_fixture_folder(dir.path(), "dicts", "untitled");
-    let scan = library.add_folder(&dir.path().join("dicts")).unwrap();
+    let scan = add_folder(&mut library, &dir.path().join("dicts"));
     let statuses: Vec<_> = scan.added.iter().map(|d| (file_name(d), d.status.clone())).collect();
     assert_eq!(
         statuses,
@@ -1013,7 +1066,7 @@ fn unusable_dictionaries_in_a_folder_are_added_with_their_error() {
 fn an_empty_folder_adds_nothing_but_is_remembered() {
     let (dir, mut library) = new_library();
     fs::create_dir_all(dir.path().join("empty")).unwrap();
-    let scan = library.add_folder(&dir.path().join("empty")).unwrap();
+    let scan = add_folder(&mut library, &dir.path().join("empty"));
     assert_eq!(scan.added, []);
     assert_eq!(library.folders().unwrap(), [scan.folder]);
 }
@@ -1039,12 +1092,12 @@ fn adding_a_file_as_a_folder_is_an_error() {
 fn rescanning_adds_only_dictionaries_placed_there_since() {
     let (dir, mut library) = new_library();
     copy_fixture_folder(dir.path(), "dicts/a", "basic");
-    let first = library.add_folder(&dir.path().join("dicts")).unwrap();
+    let first = add_folder(&mut library, &dir.path().join("dicts"));
     let basic = first.added[0].clone();
     let renamed = library.rename(basic.id, "Mine").unwrap();
 
     copy_fixture_folder(dir.path(), "dicts/b", "untitled");
-    let rescan = library.rescan_folder(first.folder.id).unwrap();
+    let rescan = rescan(&mut library, first.folder.id);
     assert_eq!(rescan.folder, first.folder);
     assert_eq!(titles(&rescan.added), ["untitled"]);
     assert_eq!(rescan.added[0].position, 1);
@@ -1058,9 +1111,9 @@ fn rescanning_adds_only_dictionaries_placed_there_since() {
 fn rescanning_an_unchanged_folder_adds_nothing() {
     let (dir, mut library) = new_library();
     let folder = dictionary_tree(dir.path());
-    let first = library.add_folder(&folder).unwrap();
+    let first = add_folder(&mut library, &folder);
     let before = library.dictionaries().unwrap();
-    assert_eq!(library.rescan_folder(first.folder.id).unwrap().added, []);
+    assert_eq!(rescan(&mut library, first.folder.id).added, []);
     assert_eq!(library.dictionaries().unwrap(), before);
 }
 
@@ -1069,9 +1122,9 @@ fn rescan_works_after_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("library.sqlite3");
     copy_fixture_folder(dir.path(), "dicts", "basic");
-    let folder = Library::open(&db).unwrap().add_folder(&dir.path().join("dicts")).unwrap().folder;
+    let folder = add_folder(&mut Library::open(&db).unwrap(), &dir.path().join("dicts")).folder;
     copy_fixture_folder(dir.path(), "dicts", "untitled");
-    let scan = Library::open(&db).unwrap().rescan_folder(folder.id).unwrap();
+    let scan = rescan(&mut Library::open(&db).unwrap(), folder.id);
     assert_eq!(titles(&scan.added), ["untitled"]);
 }
 
@@ -1079,7 +1132,7 @@ fn rescan_works_after_reopening() {
 fn rescanning_a_folder_that_is_gone_is_an_error_and_keeps_it() {
     let (dir, mut library) = new_library();
     copy_fixture_folder(dir.path(), "dicts", "untitled");
-    let folder = library.add_folder(&dir.path().join("dicts")).unwrap().folder;
+    let folder = add_folder(&mut library, &dir.path().join("dicts")).folder;
     fs::remove_dir_all(dir.path().join("dicts")).unwrap();
 
     let error = library.rescan_folder(folder.id).unwrap_err();
@@ -1099,11 +1152,11 @@ fn rescanning_an_unknown_folder_is_an_error() {
 fn adding_the_same_folder_again_is_a_no_op() {
     let (dir, mut library) = new_library();
     let folder = dictionary_tree(dir.path());
-    let first = library.add_folder(&folder).unwrap();
+    let first = add_folder(&mut library, &folder);
     let before = library.dictionaries().unwrap();
 
     for again in [folder.clone(), folder.join("basic/.."), folder.join(".")] {
-        let scan = library.add_folder(&again).unwrap();
+        let scan = add_folder(&mut library, &again);
         assert_eq!(scan.folder, first.folder, "{again:?}");
         assert_eq!(scan.added, [], "{again:?}");
     }
@@ -1115,9 +1168,9 @@ fn adding_the_same_folder_again_is_a_no_op() {
 fn a_folder_skips_dictionaries_already_added_as_files() {
     let (dir, mut library) = new_library();
     let folder = dictionary_tree(dir.path());
-    let basic = library.add_file(&folder.join("basic/basic.mdx")).unwrap();
+    let basic = add_path(&mut library, &folder.join("basic/basic.mdx"));
 
-    let scan = library.add_folder(&folder).unwrap();
+    let scan = add_folder(&mut library, &folder);
     assert_eq!(titles(&scan.added), ["Multi-volume Test Dictionary", "untitled"]);
     let listed = library.dictionaries().unwrap();
     assert_eq!((listed.len(), &listed[0]), (3, &basic));
@@ -1127,8 +1180,8 @@ fn a_folder_skips_dictionaries_already_added_as_files() {
 fn a_file_already_found_in_a_folder_is_not_added_again() {
     let (dir, mut library) = new_library();
     let folder = dictionary_tree(dir.path());
-    let scan = library.add_folder(&folder).unwrap();
-    let again = library.add_file(&folder.join("more/deeper/untitled.mdx")).unwrap();
+    let scan = add_folder(&mut library, &folder);
+    let again = add_path(&mut library, &folder.join("more/deeper/untitled.mdx"));
     assert_eq!(again, scan.added[2]);
     assert_eq!(library.dictionaries().unwrap(), scan.added);
 }
@@ -1137,8 +1190,8 @@ fn a_file_already_found_in_a_folder_is_not_added_again() {
 fn a_nested_folder_adds_nothing_its_parent_already_added() {
     let (dir, mut library) = new_library();
     let folder = dictionary_tree(dir.path());
-    library.add_folder(&folder).unwrap();
-    let nested = library.add_folder(&folder.join("more")).unwrap();
+    add_folder(&mut library, &folder);
+    let nested = add_folder(&mut library, &folder.join("more"));
     assert_eq!(nested.added, []);
     assert_eq!(library.folders().unwrap().len(), 2, "both remembered");
 }
@@ -1147,12 +1200,12 @@ fn a_nested_folder_adds_nothing_its_parent_already_added() {
 fn the_same_file_spelled_differently_is_not_added_twice() {
     let (dir, mut library) = new_library();
     copy_fixture_folder(dir.path(), "dicts/basic", "basic");
-    let first = library.add_file(&dir.path().join("dicts/basic/basic.mdx")).unwrap();
+    let first = add_path(&mut library, &dir.path().join("dicts/basic/basic.mdx"));
     for spelling in [
         dir.path().join("dicts/basic/./basic.mdx"),
         dir.path().join("dicts/basic/../basic/basic.mdx"),
     ] {
-        assert_eq!(library.add_file(&spelling).unwrap(), first, "{spelling:?}");
+        assert_eq!(add_path(&mut library, &spelling), first, "{spelling:?}");
     }
     assert_eq!(library.dictionaries().unwrap(), [first]);
 }
@@ -1162,12 +1215,12 @@ fn the_same_file_spelled_differently_is_not_added_twice() {
 fn paths_differing_only_in_case_are_the_same_on_windows() {
     let (dir, mut library) = new_library();
     copy_fixture_folder(dir.path(), "dicts/basic", "basic");
-    let first = library.add_file(&dir.path().join("dicts/basic/basic.mdx")).unwrap();
-    assert_eq!(library.add_file(&dir.path().join("DICTS/BASIC/BASIC.MDX")).unwrap(), first);
+    let first = add_path(&mut library, &dir.path().join("dicts/basic/basic.mdx"));
+    assert_eq!(add_path(&mut library, &dir.path().join("DICTS/BASIC/BASIC.MDX")), first);
 
-    let scan = library.add_folder(&dir.path().join("Dicts")).unwrap();
+    let scan = add_folder(&mut library, &dir.path().join("Dicts"));
     assert_eq!(scan.added, []);
-    assert_eq!(library.add_folder(&dir.path().join("dicts")).unwrap().folder, scan.folder);
+    assert_eq!(add_folder(&mut library, &dir.path().join("dicts")).folder, scan.folder);
     assert_eq!(library.folders().unwrap().len(), 1);
     assert_eq!(library.dictionaries().unwrap(), [first]);
 }
@@ -1177,8 +1230,8 @@ fn removing_a_folder_forgets_it_and_keeps_its_dictionaries() {
     let (dir, mut library) = new_library();
     copy_fixture_folder(dir.path(), "a", "basic");
     copy_fixture_folder(dir.path(), "b", "untitled");
-    let a = library.add_folder(&dir.path().join("a")).unwrap();
-    let b = library.add_folder(&dir.path().join("b")).unwrap();
+    let a = add_folder(&mut library, &dir.path().join("a"));
+    let b = add_folder(&mut library, &dir.path().join("b"));
     let before = library.dictionaries().unwrap();
 
     assert_eq!(library.remove_folder(a.folder.id).unwrap(), std::slice::from_ref(&b.folder));
@@ -1194,8 +1247,295 @@ fn removing_a_folder_forgets_it_and_keeps_its_dictionaries() {
 fn a_removed_dictionary_comes_back_when_its_folder_is_rescanned() {
     let (dir, mut library) = new_library();
     copy_fixture_folder(dir.path(), "dicts", "untitled");
-    let scan = library.add_folder(&dir.path().join("dicts")).unwrap();
+    let scan = add_folder(&mut library, &dir.path().join("dicts"));
     library.remove(scan.added[0].id).unwrap();
-    let rescan = library.rescan_folder(scan.folder.id).unwrap();
+    let rescan = rescan(&mut library, scan.folder.id);
     assert_eq!(titles(&rescan.added), ["untitled"]);
+}
+
+// --- indexing -------------------------------------------------------------
+
+fn go_on(_: DictionaryId, _: Progress) -> ControlFlow<()> {
+    ControlFlow::Continue(())
+}
+
+#[test]
+fn a_new_dictionary_waits_for_the_indexer() {
+    let (_dir, mut library) = new_library();
+    let added = library.add_file(&fixture("basic/basic.mdx")).unwrap();
+    assert_eq!(added.status, Status::Indexing);
+    assert_eq!(added.title, "basic", "the file name until indexed");
+    assert_eq!((added.headword_count, added.file), (0, None));
+    assert_eq!(library.search("", 0, 10).unwrap().total_count, 0);
+    assert_eq!(library.article("go").unwrap(), Article { sections: vec![] });
+    assert_eq!(library.resource(added.id, "basic.css").unwrap(), None);
+
+    let mut indexer = library.indexer().unwrap();
+    assert_eq!(indexer.index_next(go_on).unwrap(), Some(added.id));
+    assert_eq!(indexer.index_next(go_on).unwrap(), None, "nothing else waits");
+    let ready = current(&library, added.id);
+    assert_eq!(ready.status, Status::Ready);
+    assert_eq!(ready.title, "Basic Test Dictionary");
+    assert_eq!(search_all(&library, "pol"), ["Polish", "polish"]);
+}
+
+#[test]
+fn dictionaries_are_indexed_in_the_order_added() {
+    let (_dir, mut library) = new_library();
+    let untitled = library.add_file(&fixture("untitled/untitled.mdx")).unwrap().id;
+    let basic = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+    let mut indexer = library.indexer().unwrap();
+    assert_eq!(indexer.index_next(go_on).unwrap(), Some(untitled));
+    assert_eq!(indexer.index_next(go_on).unwrap(), Some(basic));
+    assert_eq!(indexer.index_next(go_on).unwrap(), None);
+}
+
+#[test]
+fn indexing_reports_progress_after_each_batch() {
+    let (_dir, mut library) = new_library();
+    let id = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+    let mut seen = Vec::new();
+    library
+        .indexer()
+        .unwrap()
+        .batch_size(5)
+        .index_next(|dictionary, progress| {
+            seen.push((dictionary, progress.done, progress.total));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(seen, [(id, 0, 19), (id, 5, 19), (id, 10, 19), (id, 15, 19)]);
+    assert_eq!(current(&library, id).headword_count, 19);
+}
+
+#[test]
+fn search_keeps_working_while_another_dictionary_is_indexed() {
+    let (_dir, mut library) = basic_library();
+    library.add_file(&fixture("untitled/untitled.mdx")).unwrap();
+    let mut during = Vec::new();
+    library
+        .indexer()
+        .unwrap()
+        .batch_size(1)
+        .index_next(|_, _| {
+            during.push((search_all(&library, "go"), search_all(&library, "n")));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert!(!during.is_empty());
+    for (go, n) in during {
+        assert_eq!(go, ["go"], "ready dictionaries stay searchable");
+        assert_eq!(n, [] as [&str; 0], "not searchable until indexing completes");
+    }
+    assert_eq!(search_all(&library, "n"), ["nameless"]);
+}
+
+#[test]
+fn cancelling_a_run_under_way_keeps_nothing() {
+    let (_dir, mut library) = new_library();
+    let id = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+    let mut indexer = library.indexer().unwrap().batch_size(5);
+    let mut cancelled = None;
+    let indexed = indexer
+        .index_next(|_, progress| {
+            if progress.done == 10 {
+                cancelled = Some(library.cancel_indexing(id).unwrap());
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(indexed, Some(id));
+    assert_eq!(cancelled.expect("cancelled mid-run").status, Status::NeedsReindex);
+
+    let info = current(&library, id);
+    assert_eq!((info.status, info.headword_count), (Status::NeedsReindex, 0));
+    assert_eq!(library.search("", 0, 10).unwrap().total_count, 0);
+    assert_eq!(library.article("bank").unwrap(), Article { sections: vec![] });
+    assert_eq!(indexer.index_next(go_on).unwrap(), None, "not picked up again");
+
+    assert_eq!(library.reindex(id).unwrap().status, Status::Indexing);
+    index_all(&library);
+    let info = current(&library, id);
+    assert_eq!((info.status, info.headword_count), (Status::Ready, 19), "nothing doubled");
+    assert_eq!(search_all(&library, ""), BASIC_SORTED);
+}
+
+#[test]
+fn cancelling_a_waiting_dictionary() {
+    let (_dir, mut library) = new_library();
+    let id = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+    assert_eq!(library.cancel_indexing(id).unwrap().status, Status::NeedsReindex);
+    assert_eq!(library.indexer().unwrap().index_next(go_on).unwrap(), None);
+    assert_eq!(library.cancel_indexing(id).unwrap().status, Status::NeedsReindex, "again: no change");
+
+    let ready = add(&mut library, "untitled/untitled.mdx");
+    assert_eq!(library.cancel_indexing(ready.id).unwrap(), ready, "nothing to cancel");
+    let error = library.cancel_indexing(DictionaryId::from_raw(99)).unwrap_err();
+    assert_eq!(error.to_string(), "no dictionary with id 99 in the library");
+}
+
+#[test]
+fn an_interrupted_run_needs_reindexing_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    let id = {
+        let mut library = Library::open(&db).unwrap();
+        add(&mut library, "untitled/untitled.mdx");
+        let id = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+        let indexed = library
+            .indexer()
+            .unwrap()
+            .batch_size(5)
+            .index_next(|_, progress| {
+                if progress.done < 10 {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
+                }
+            })
+            .unwrap();
+        assert_eq!(indexed, Some(id));
+        assert_eq!(current(&library, id).status, Status::Indexing, "stopped mid-run");
+        assert_eq!(search_all(&library, "bank"), [] as [&str; 0], "half an index is not searchable");
+        id
+        // The app stops here.
+    };
+
+    let mut library = Library::open(&db).unwrap();
+    let info = current(&library, id);
+    assert_eq!((info.status, info.headword_count), (Status::NeedsReindex, 0));
+    assert_eq!(search_all(&library, "bank"), [] as [&str; 0]);
+    assert_eq!(search_all(&library, "n"), ["nameless"], "ready dictionaries are untouched");
+    assert_eq!(library.indexer().unwrap().index_next(go_on).unwrap(), None, "not resumed by itself");
+
+    library.reindex(id).unwrap();
+    index_all(&library);
+    let info = current(&library, id);
+    assert_eq!((info.status, info.headword_count), (Status::Ready, 19), "nothing doubled");
+    assert_eq!(search_all(&library, "bank"), ["bank"]);
+}
+
+#[test]
+fn reindexing_keeps_the_settings() {
+    let (_dir, mut library) = new_library();
+    add(&mut library, "untitled/untitled.mdx");
+    let id = add(&mut library, "basic/basic.mdx").id;
+    library.rename(id, "Mine").unwrap();
+    library.set_allow_scripts(id, true).unwrap();
+    library.move_dictionary(id, 0).unwrap();
+    let before = current(&library, id);
+
+    let reindexing = library.reindex(id).unwrap();
+    assert_eq!((reindexing.status, reindexing.headword_count), (Status::Indexing, 0));
+    assert_eq!(search_all(&library, "bank"), [] as [&str; 0], "not searchable while reindexing");
+    index_all(&library);
+    assert_eq!(current(&library, id), before);
+
+    library.set_enabled(id, false).unwrap();
+    library.reindex(id).unwrap();
+    index_all(&library);
+    assert!(!current(&library, id).enabled);
+
+    let error = library.reindex(DictionaryId::from_raw(99)).unwrap_err();
+    assert_eq!(error.to_string(), "no dictionary with id 99 in the library");
+}
+
+#[test]
+fn reindexing_during_a_run_starts_it_over() {
+    let (_dir, mut library) = new_library();
+    let id = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+    let mut indexer = library.indexer().unwrap().batch_size(5);
+    let mut restarted = false;
+    indexer
+        .index_next(|_, progress| {
+            if progress.done == 10 {
+                library.reindex(id).unwrap();
+                restarted = true;
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert!(restarted);
+    assert_eq!(current(&library, id).status, Status::Indexing, "the new run waits");
+    assert_eq!(indexer.index_next(go_on).unwrap(), Some(id));
+    let info = current(&library, id);
+    assert_eq!((info.status, info.headword_count), (Status::Ready, 19));
+    assert_eq!(search_all(&library, ""), BASIC_SORTED);
+}
+
+#[test]
+fn removing_a_dictionary_during_its_run_stops_it() {
+    let (_dir, mut library) = new_library();
+    let id = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+    let other = library.add_file(&fixture("untitled/untitled.mdx")).unwrap().id;
+    let mut indexer = library.indexer().unwrap().batch_size(5);
+    let indexed = indexer
+        .index_next(|_, progress| {
+            if progress.done == 5 {
+                library.remove(id).unwrap();
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(indexed, Some(id));
+    assert_eq!(indexer.index_next(go_on).unwrap(), Some(other));
+    let ids: Vec<_> = library.dictionaries().unwrap().iter().map(|d| d.id).collect();
+    assert_eq!(ids, [other]);
+    assert_eq!(search_all(&library, "bank"), [] as [&str; 0]);
+    assert_eq!(search_all(&library, "n"), ["nameless"]);
+}
+
+#[test]
+fn a_dictionary_failing_mid_run_keeps_nothing() {
+    let (_dir, mut library) = new_library();
+    let id = library.add_file(&fixture("damaged/damaged.mdx")).unwrap().id;
+    let mut written = 0;
+    library
+        .indexer()
+        .unwrap()
+        .batch_size(1)
+        .index_next(|_, progress| {
+            written = progress.done;
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert!(written > 0, "some headwords were written before the failure");
+    let info = current(&library, id);
+    assert!(matches!(&info.status, Status::Error(m) if m.starts_with("damaged")), "{:?}", info.status);
+    assert_eq!(info.headword_count, 0);
+    assert_eq!(search_all(&library, "alpha"), [] as [&str; 0]);
+}
+
+#[test]
+fn the_background_indexer_indexes_what_it_is_woken_for() {
+    let (_dir, mut library) = new_library();
+    let (send, events) = mpsc::channel();
+    let indexer = library.indexer().unwrap().batch_size(5).spawn(move |event| {
+        let _ = send.send(event);
+    });
+    let wait_until_finished = |id| {
+        let mut seen = Vec::new();
+        loop {
+            let event = events.recv_timeout(Duration::from_secs(30)).expect("an event");
+            seen.push(event);
+            if event == (IndexEvent::Finished { dictionary: id }) {
+                return seen;
+            }
+        }
+    };
+
+    let id = library.add_file(&fixture("basic/basic.mdx")).unwrap().id;
+    indexer.wake();
+    let progress = |done| IndexEvent::Progress { dictionary: id, progress: Progress { done, total: 19 } };
+    assert_eq!(
+        wait_until_finished(id),
+        [progress(0), progress(5), progress(10), progress(15), IndexEvent::Finished { dictionary: id }]
+    );
+    assert_eq!(current(&library, id).status, Status::Ready);
+
+    // It sleeps between jobs, and wakes for the next.
+    let other = library.add_file(&fixture("untitled/untitled.mdx")).unwrap().id;
+    indexer.wake();
+    wait_until_finished(other);
+    assert_eq!(search_all(&library, "n"), ["nameless"]);
 }

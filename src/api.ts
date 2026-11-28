@@ -2,6 +2,7 @@
 // The interfaces mirror the Rust DTOs there: change both together.
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
 export interface DictionaryInfo {
   id: number;
@@ -12,12 +13,35 @@ export interface DictionaryInfo {
   fileTitle: string;
   position: number;
   enabled: boolean;
-  status: "ready" | "error";
+  /**
+   * `"indexing"`: waiting for or being indexed in the background, not
+   * searchable yet (progress comes as `IndexingEvent`s). `"needs_reindex"`:
+   * indexing was stopped or interrupted.
+   */
+  status: "indexing" | "ready" | "needs_reindex" | "error";
   /** Why the dictionary can't be used, when `status` is `"error"`. */
   error: string | null;
   /** Whether the dictionary's own JavaScript may run in its articles. */
   allowScripts: boolean;
   headwordCount: number;
+}
+
+/**
+ * How far the background indexer has got with a dictionary, or (`finished`)
+ * that it is done with it, whatever the outcome: refetch to see which.
+ */
+export interface IndexingEvent {
+  dictionaryId: number;
+  finished: boolean;
+  /** Headwords written so far (0 when finished). */
+  done: number;
+  /** Headwords expected (0 when finished). */
+  total: number;
+}
+
+/** Calls `handler` for each indexer event. Resolves to the unsubscribe function. */
+export function onIndexing(handler: (event: IndexingEvent) => void): Promise<UnlistenFn> {
+  return listen<IndexingEvent>("indexing", (e) => handler(e.payload));
 }
 
 export interface FolderInfo {
@@ -52,6 +76,7 @@ export interface Article {
 
 // Each call rejects with a readable message string when the library fails.
 
+/** Resolves at once; the dictionary is indexed in the background. */
 export function addFile(path: string): Promise<DictionaryInfo> {
   return invoke("add_file", { path });
 }
@@ -105,6 +130,16 @@ export function renameDictionary(dictionaryId: number, name: string): Promise<Di
 /** Resolves to the new listing. */
 export function moveDictionary(dictionaryId: number, position: number): Promise<DictionaryInfo[]> {
   return invoke("move_dictionary", { dictionaryId, position });
+}
+
+/** Indexes the dictionary again from its file, in the background. */
+export function reindexDictionary(dictionaryId: number): Promise<DictionaryInfo> {
+  return invoke("reindex_dictionary", { dictionaryId });
+}
+
+/** Stops indexing the dictionary; it is left needing reindexing. */
+export function cancelIndexing(dictionaryId: number): Promise<DictionaryInfo> {
+  return invoke("cancel_indexing", { dictionaryId });
 }
 
 /** Resolves to the new listing. The file itself is left alone. */

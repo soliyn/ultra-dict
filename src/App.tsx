@@ -18,6 +18,11 @@ export default function App() {
   // dictionary list are fetched again.
   const [libraryVersion, setLibraryVersion] = useState(0);
   const libraryChanged = useCallback(() => setLibraryVersion((v) => v + 1), []);
+  // A dictionary the indexer is done with may have become searchable.
+  useEffect(() => {
+    const unlisten = api.onIndexing((event) => event.finished && libraryChanged());
+    return () => void unlisten.then((stop) => stop());
+  }, [libraryChanged]);
   const results = useSearch(query, libraryVersion);
   const resultKey = `${libraryVersion}:${query}`;
   const searchRef = useRef<HTMLInputElement>(null);

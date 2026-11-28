@@ -26,6 +26,20 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
   const [adding, setAdding] = useState<"file" | "folder" | number | null>(null);
   // Changes run one at a time, so rapid clicks can't interleave.
   const [busy, setBusy] = useState(false);
+  // How far the indexer has got, by dictionary id, for those it is on.
+  const [progress, setProgress] = useState<ReadonlyMap<number, api.IndexingEvent>>(new Map());
+
+  useEffect(() => {
+    const unlisten = api.onIndexing((event) =>
+      setProgress((prev) => {
+        const next = new Map(prev);
+        if (event.finished) next.delete(event.dictionaryId);
+        else next.set(event.dictionaryId, event);
+        return next;
+      }),
+    );
+    return () => void unlisten.then((stop) => stop());
+  }, []);
 
   useEffect(() => {
     let current = true;
@@ -90,10 +104,8 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
         filters: [{ name: strings.dictionaryFilter, extensions: ["mdx"] }],
       });
       if (path === null) return undefined;
-      const info = await api.addFile(path);
-      return info.status === "error"
-        ? { message: strings.dictionaryUnusable(info.title, info.error ?? ""), error: true }
-        : null;
+      await api.addFile(path);
+      return null;
     });
 
   const addFolder = () =>
@@ -180,7 +192,10 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
             index={index}
             last={index === count - 1}
             busy={locked}
+            progress={progress.get(d.id)}
             onEnabled={(enabled) => change(() => api.setEnabled(d.id, enabled))}
+            onReindex={() => change(() => api.reindexDictionary(d.id))}
+            onStopIndexing={() => change(() => api.cancelIndexing(d.id))}
             onMove={(position) => change(() => api.moveDictionary(d.id, position))}
             onRename={(name) => change(() => api.renameDictionary(d.id, name))}
             onRemove={() => change(() => api.removeDictionary(d.id))}
@@ -200,8 +215,7 @@ interface Notice {
 /** What a folder add or rescan found, as a notice. */
 function scanNotice({ folder, added }: api.FolderScan): Notice {
   if (added.length === 0) return { message: strings.scanFoundNothing(folder.path), error: false };
-  const unusable = added.filter((d) => d.status === "error").length;
-  return { message: strings.scanAdded(added.length, unusable), error: unusable > 0 };
+  return { message: strings.scanAdded(added.length), error: false };
 }
 
 interface RowProps {
@@ -210,14 +224,20 @@ interface RowProps {
   index: number;
   last: boolean;
   busy: boolean;
+  /** The indexer's latest progress, while it is on this dictionary. */
+  progress: api.IndexingEvent | undefined;
   onEnabled(enabled: boolean): void;
+  onReindex(): void;
+  onStopIndexing(): void;
   onMove(position: number): void;
   /** Resolves to whether the rename succeeded. */
   onRename(name: string): Promise<boolean>;
   onRemove(): void;
 }
 
-function DictionaryRow({ dictionary: d, index, last, busy, onEnabled, onMove, onRename, onRemove }: RowProps) {
+function DictionaryRow(props: RowProps) {
+  const { dictionary: d, index, last, busy, progress, onEnabled, onReindex, onStopIndexing } = props;
+  const { onMove, onRename, onRemove } = props;
   // The name being typed, while renaming.
   const [draft, setDraft] = useState<string | null>(null);
   const [confirmingRemove, setConfirmingRemove] = useState(false);
@@ -228,7 +248,7 @@ function DictionaryRow({ dictionary: d, index, last, busy, onEnabled, onMove, on
     void onRename(draft).then((ok) => ok && setDraft(null));
   };
 
-  const status = d.status === "error" ? strings.statusError(d.error ?? "") : strings.statusReady(d.headwordCount);
+  const status = statusText(d, progress);
 
   return (
     <li className={"library-row" + (d.enabled ? "" : " disabled")}>
@@ -269,6 +289,16 @@ function DictionaryRow({ dictionary: d, index, last, busy, onEnabled, onMove, on
         <div className={"library-status" + (d.status === "error" ? " error" : "")}>{d.enabled ? status : strings.statusDisabled(status)}</div>
       </div>
       <div className="library-actions">
+        {d.status === "indexing" && (
+          <button className="button" onClick={onStopIndexing} disabled={busy} title={strings.stopIndexingHint}>
+            {strings.stopIndexing}
+          </button>
+        )}
+        {(d.status === "needs_reindex" || d.status === "error") && (
+          <button className="button" onClick={onReindex} disabled={busy} title={strings.reindexHint}>
+            {strings.reindex}
+          </button>
+        )}
         <button
           className="button icon"
           onClick={() => onMove(index - 1)}
@@ -311,4 +341,17 @@ function DictionaryRow({ dictionary: d, index, last, busy, onEnabled, onMove, on
       </div>
     </li>
   );
+}
+
+function statusText(d: api.DictionaryInfo, progress: api.IndexingEvent | undefined): string {
+  switch (d.status) {
+    case "indexing":
+      return progress ? strings.statusIndexing(progress.done, progress.total) : strings.statusWaiting;
+    case "ready":
+      return strings.statusReady(d.headwordCount);
+    case "needs_reindex":
+      return strings.statusNeedsReindex;
+    case "error":
+      return strings.statusError(d.error ?? "");
+  }
 }

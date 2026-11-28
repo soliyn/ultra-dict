@@ -1,5 +1,6 @@
 //! The `dict` URI scheme's responses, for URL paths as the webview sends them.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use tauri::http::{Response, StatusCode, header};
@@ -25,6 +26,8 @@ fn library() -> Fixture {
     let mut library = Library::open(&dir.path().join("library.sqlite3")).unwrap();
     let basic = library.add_file(&fixture("basic/basic.mdx")).unwrap().id.to_raw();
     let loose = library.add_file(&fixture("loose-css/loose.mdx")).unwrap().id.to_raw();
+    let mut indexer = library.indexer().unwrap();
+    while indexer.index_next(|_, _| ControlFlow::Continue(())).unwrap().is_some() {}
     Fixture { _dir: dir, library, basic, loose }
 }
 

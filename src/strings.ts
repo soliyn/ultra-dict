@@ -21,13 +21,11 @@ export const strings = {
   rescanHint: "Add the dictionaries placed in this folder since it was last scanned.",
   forgetFolder: "Forget",
   forgetFolderHint: "Stop offering this folder for rescanning. Its dictionaries stay in the library.",
-  scanAdded: (added: number, unusable: number) =>
-    (added === 1 ? "Added 1 dictionary" : `Added ${added.toLocaleString("en")} dictionaries`) +
-    (unusable === 0 ? "." : ` (${unusable.toLocaleString("en")} can't be used).`),
+  scanAdded: (added: number) =>
+    added === 1 ? "Added 1 dictionary." : `Added ${added.toLocaleString("en")} dictionaries.`,
   scanFoundNothing: (path: string) => `No new dictionaries in ${path}.`,
   dictionaryFilter: "MDict dictionaries",
   addFailed: (message: string) => `Couldn't add the dictionary: ${message}`,
-  dictionaryUnusable: (title: string, message: string) => `${title} can't be used: ${message}`,
   dismiss: "Dismiss",
   noArticle: "No dictionary has this word any more.",
   articleFailed: (message: string) => `Couldn't open the article: ${message}`,
@@ -40,9 +38,17 @@ export const strings = {
   enabledLabel: (title: string) => `Use ${title}`,
   statusReady: (count: number) =>
     count === 1 ? "Ready · 1 headword" : `Ready · ${count.toLocaleString("en")} headwords`,
+  statusWaiting: "Waiting to be indexed",
+  statusIndexing: (done: number, total: number) =>
+    `Indexing… ${total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : 0}%`,
+  statusNeedsReindex: "Not indexed: indexing was stopped",
   statusDisabled: (status: string) => `Disabled · ${status}`,
   statusError: (message: string) => `Error: ${message}`,
   originalTitle: (title: string) => `Title in the file: ${title}`,
+  stopIndexing: "Stop",
+  stopIndexingHint: "Stop indexing this dictionary. You can reindex it later.",
+  reindex: "Reindex",
+  reindexHint: "Read the dictionary file again.",
   rename: "Rename",
   renameLabel: "New name",
   renameHint: "Leave empty to use the title from the file.",

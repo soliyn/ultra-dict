@@ -4,13 +4,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder, mock_context, noop_assets};
 use tauri::webview::InvokeRequest;
-use tauri::{App, WebviewWindow, WebviewWindowBuilder};
+use tauri::{App, Listener, WebviewWindow, WebviewWindowBuilder};
 use tempfile::TempDir;
+use ultra_dict_lib::commands::INDEXING_EVENT;
 use ultra_dict_lib::library::Library;
 
 fn fixture(rel: &str) -> PathBuf {
@@ -21,6 +24,8 @@ struct TestApp {
     _dir: TempDir,
     _app: App<MockRuntime>,
     webview: WebviewWindow<MockRuntime>,
+    /// Payloads of the indexer's events, as the frontend receives them.
+    indexing: Receiver<Value>,
 }
 
 impl TestApp {
@@ -31,10 +36,35 @@ impl TestApp {
             .manage(Mutex::new(library))
             .build(mock_context(noop_assets()))
             .expect("build app");
+        let (send, indexing) = mpsc::channel();
+        app.listen_any(INDEXING_EVENT, move |event| {
+            let _ = send.send(serde_json::from_str(event.payload()).unwrap());
+        });
+        ultra_dict_lib::start_indexer(app.handle()).expect("start indexer");
         let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .unwrap();
-        Self { _dir: dir, _app: app, webview }
+        Self { _dir: dir, _app: app, webview, indexing }
+    }
+
+    /// Waits for the indexer to finish with dictionary `id` and returns the
+    /// events it sent until then.
+    fn wait_for_indexing(&self, id: &Value) -> Vec<Value> {
+        let mut seen = Vec::new();
+        loop {
+            let event = self.indexing.recv_timeout(Duration::from_secs(30)).expect("indexing event");
+            let done = event["dictionaryId"] == *id && event["finished"] == true;
+            seen.push(event);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    /// Dictionary `id` as `dictionaries` lists it.
+    fn dictionary(&self, id: &Value) -> Value {
+        let list = self.invoke("dictionaries", json!({})).unwrap();
+        list.as_array().unwrap().iter().find(|d| d["id"] == *id).expect("listed").clone()
     }
 
     /// `invoke(cmd, args)`: the resolved value, or the rejected one.
@@ -55,17 +85,36 @@ impl TestApp {
         .map(|body| body.deserialize::<Value>().unwrap())
     }
 
+    /// Adds fixture `rel`, waits until it is indexed, and returns it.
     fn add(&self, rel: &str) -> Value {
-        self.invoke("add_file", json!({ "path": fixture(rel) }))
-            .unwrap_or_else(|e| panic!("add_file {rel}: {e}"))
+        let added = self
+            .invoke("add_file", json!({ "path": fixture(rel) }))
+            .unwrap_or_else(|e| panic!("add_file {rel}: {e}"));
+        self.wait_for_indexing(&added["id"]);
+        self.dictionary(&added["id"])
     }
 }
 
 #[test]
-fn add_file_returns_the_dictionary() {
+fn add_file_returns_the_dictionary_and_indexes_it_in_the_background() {
     let app = TestApp::new();
-    let info = app.add("basic/basic.mdx");
-    assert!(info["id"].is_i64(), "{info}");
+    let added = app
+        .invoke("add_file", json!({ "path": fixture("basic/basic.mdx") }))
+        .unwrap();
+    assert!(added["id"].is_i64(), "{added}");
+    assert_eq!(added["status"], "indexing");
+    assert_eq!(added["title"], "basic");
+    let id = added["id"].clone();
+    let events = app.wait_for_indexing(&id);
+    assert_eq!(
+        events,
+        [
+            json!({ "dictionaryId": id, "finished": false, "done": 0, "total": 19 }),
+            json!({ "dictionaryId": id, "finished": true, "done": 0, "total": 0 }),
+        ]
+    );
+
+    let info = app.dictionary(&id);
     assert_eq!(Path::new(info["path"].as_str().unwrap()), fixture("basic/basic.mdx"));
     assert_eq!(info["title"], "Basic Test Dictionary");
     assert_eq!(info["position"], 0);
@@ -161,8 +210,11 @@ fn folder_commands() {
     );
     let added = scan["added"].as_array().unwrap();
     assert_eq!(added.len(), 1);
-    assert_eq!(added[0]["title"], "Multi-volume Test Dictionary");
-    assert_eq!(added[0]["status"], "ready");
+    assert_eq!(added[0]["status"], "indexing");
+    app.wait_for_indexing(&added[0]["id"]);
+    let info = app.dictionary(&added[0]["id"]);
+    assert_eq!(info["title"], "Multi-volume Test Dictionary");
+    assert_eq!(info["status"], "ready");
     assert_eq!(app.invoke("folders", json!({})).unwrap(), json!([folder]));
 
     let rescan = app.invoke("rescan_folder", json!({ "folderId": folder["id"] })).unwrap();
@@ -208,4 +260,26 @@ fn library_management_commands() {
 
     let error = app.invoke("remove_dictionary", json!({ "dictionaryId": 999 })).unwrap_err();
     assert_eq!(error, "no dictionary with id 999 in the library");
+}
+
+#[test]
+fn reindex_and_cancel_commands() {
+    let app = TestApp::new();
+    let basic = app.add("basic/basic.mdx");
+    let id = basic["id"].clone();
+
+    let reindexing = app.invoke("reindex_dictionary", json!({ "dictionaryId": id })).unwrap();
+    assert_eq!(reindexing["status"], "indexing");
+    assert_eq!(reindexing["headwordCount"], 0);
+    app.wait_for_indexing(&id);
+    assert_eq!(app.dictionary(&id), basic);
+
+    // Nothing under way: cancelling changes nothing.
+    let info = app.invoke("cancel_indexing", json!({ "dictionaryId": id })).unwrap();
+    assert_eq!(info, basic);
+
+    for cmd in ["reindex_dictionary", "cancel_indexing"] {
+        let error = app.invoke(cmd, json!({ "dictionaryId": 999 })).unwrap_err();
+        assert_eq!(error, "no dictionary with id 999 in the library", "{cmd}");
+    }
 }
