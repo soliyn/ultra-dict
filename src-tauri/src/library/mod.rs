@@ -445,8 +445,12 @@ impl Library {
     /// one section per enabled, ready dictionary that has it, in library
     /// order. Each section lists its entries in file order.
     ///
-    /// Entries are raw HTML; redirects (`@@@LINK=…`) are returned as they
-    /// are. A headword no dictionary has gives an article with no sections.
+    /// Entries are raw HTML. A redirect entry (MDict `@@@LINK=go`) is
+    /// replaced by the entries of its target in the same dictionary, followed
+    /// for up to 5 hops; the section records the final target, unless it
+    /// also shows entries of the headword's own. A redirect that loops, goes on too long or leads nowhere is
+    /// left out, and a section left with nothing says why. A headword no
+    /// dictionary has gives an article with no sections.
     pub fn article(&self, headword: &str) -> Result<Article, LibraryError> {
         let mut stmt = self.db.prepare_cached(
             "SELECT d.id, COALESCE(d.user_title, d.title), d.path, d.allow_scripts, h.locator
@@ -483,22 +487,137 @@ impl Library {
             }
         }
 
-        let sections = found
-            .into_iter()
-            .map(|Found { id, title, path, allow_scripts, locators }| {
-                let entries = self
-                    .reader(id, Path::new(&path))
-                    .and_then(|dict| locators.into_iter().map(|l| dict.entry(l)).collect())
-                    .map_err(|e| e.to_string());
-                ArticleSection {
-                    dictionary_id: id,
-                    dictionary_title: title,
-                    allow_scripts,
-                    entries,
-                }
-            })
-            .collect();
+        let mut sections = Vec::with_capacity(found.len());
+        for Found { id, title, path, allow_scripts, locators } in found {
+            let resolved = match self.reader(id, Path::new(&path)) {
+                Ok(dict) => self.resolve(id, dict.as_ref(), headword, locators)?,
+                Err(e) => Err(e.to_string()),
+            };
+            let (entries, redirect) = match resolved {
+                Ok(Resolved { entries, redirect, .. }) => (Ok(entries), redirect),
+                Err(message) => (Err(message), None),
+            };
+            sections.push(ArticleSection {
+                dictionary_id: id,
+                dictionary_title: title,
+                allow_scripts,
+                redirect,
+                entries,
+            });
+        }
         Ok(Article { sections })
+    }
+
+    /// Reads `headword`'s entries at `locators` from dictionary `id`,
+    /// following redirects. The inner `Err` is the section's message: the
+    /// file can't be read, or every entry is a broken redirect.
+    fn resolve(
+        &self,
+        id: DictionaryId,
+        dict: &dyn Dictionary,
+        headword: &str,
+        locators: Vec<EntryLocator>,
+    ) -> Result<Result<Resolved, String>, LibraryError> {
+        let mut resolved = Resolved::default();
+        for locator in locators {
+            let mut chain = vec![headword.to_owned()];
+            match self.follow(id, dict, &mut chain, locator, &mut resolved) {
+                Ok(()) => {}
+                Err(Unresolved::Read(e)) => return Ok(Err(e.to_string())),
+                Err(Unresolved::Library(e)) => return Err(e),
+            }
+        }
+        // A section that shows some of the headword's own entries isn't
+        // labelled as a redirect.
+        if resolved.own_entry {
+            resolved.redirect = None;
+        }
+        match resolved.broken.take() {
+            Some(broken) if resolved.entries.is_empty() => Ok(Err(broken)),
+            _ => Ok(Ok(resolved)),
+        }
+    }
+
+    /// Adds the entry at `locator` to `resolved`, or what it redirects to.
+    /// `chain` holds the headwords that led here, this entry's own last.
+    fn follow(
+        &self,
+        id: DictionaryId,
+        dict: &dyn Dictionary,
+        chain: &mut Vec<String>,
+        locator: EntryLocator,
+        resolved: &mut Resolved,
+    ) -> Result<(), Unresolved> {
+        let html = dict.entry(locator).map_err(Unresolved::Read)?;
+        let Some(target) = dict.redirect_target(&html) else {
+            // Two redirects to one entry show it once.
+            if !resolved.seen.contains(&locator) {
+                resolved.seen.push(locator);
+                resolved.entries.push(html);
+                if chain.len() == 1 {
+                    resolved.own_entry = true;
+                } else if resolved.redirect.is_none() {
+                    resolved.redirect = chain.last().cloned();
+                }
+            }
+            return Ok(());
+        };
+
+        let Some((spelling, locators)) = self.redirect_entries(id, target)? else {
+            resolved.broken.get_or_insert_with(|| {
+                format!("the entry redirects to \"{target}\", which this dictionary doesn't have")
+            });
+            return Ok(());
+        };
+        let looped = chain.contains(&spelling);
+        let hops = chain.len() - 1;
+        chain.push(spelling);
+        if looped {
+            resolved.broken.get_or_insert_with(|| {
+                format!("the entry's redirects go round in a loop: {}", chain.join(" → "))
+            });
+        } else if hops == MAX_REDIRECTS {
+            resolved.broken.get_or_insert_with(|| {
+                format!(
+                    "the entry leads through more than {MAX_REDIRECTS} redirects: {}",
+                    chain.join(" → ")
+                )
+            });
+        } else {
+            for locator in locators {
+                self.follow(id, dict, chain, locator, resolved)?;
+            }
+        }
+        chain.pop();
+        Ok(())
+    }
+
+    /// The entries a redirect to `target` reaches in dictionary `id`, with
+    /// the headword's spelling: `target` exactly if the dictionary has it,
+    /// else the first spelling that folds alike. `None` if neither exists.
+    fn redirect_entries(
+        &self,
+        id: DictionaryId,
+        target: &str,
+    ) -> Result<Option<(String, Vec<EntryLocator>)>, LibraryError> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT headword, locator FROM headwords
+             WHERE dictionary_id = ?1 AND folded = ?2
+             ORDER BY headword <> ?3, headword, locator",
+        )?;
+        let rows = stmt.query_map(params![id.0, fold(target), target], |row| {
+            Ok((row.get::<_, String>(0)?, EntryLocator::from_raw(row.get::<_, i64>(1)? as u64)))
+        })?;
+        let mut found: Option<(String, Vec<EntryLocator>)> = None;
+        for row in rows {
+            let (spelling, locator) = row?;
+            match &mut found {
+                None => found = Some((spelling, vec![locator])),
+                Some((first, locators)) if *first == spelling => locators.push(locator),
+                Some(_) => break,
+            }
+        }
+        Ok(found)
     }
 
     /// Lets dictionary `id`'s own JavaScript run in its articles, or stops it.
@@ -757,6 +876,39 @@ pub struct Article {
     pub sections: Vec<ArticleSection>,
 }
 
+/// How many redirects in a row an article follows before giving up (the
+/// loop guard).
+const MAX_REDIRECTS: usize = 5;
+
+/// One dictionary's entries for an article, as [`Library::follow`]
+/// gathers them.
+#[derive(Default)]
+struct Resolved {
+    entries: Vec<String>,
+    /// Where the entries came from, to show each only once.
+    seen: Vec<EntryLocator>,
+    /// The final target of the first redirect followed.
+    redirect: Option<String>,
+    /// Whether some entry is the headword's own, reached without a redirect.
+    own_entry: bool,
+    /// Why the first broken redirect was left out.
+    broken: Option<String>,
+}
+
+/// Why [`Library::follow`] stopped.
+enum Unresolved {
+    /// The dictionary file couldn't be read.
+    Read(FormatError),
+    /// The library database failed.
+    Library(LibraryError),
+}
+
+impl From<LibraryError> for Unresolved {
+    fn from(e: LibraryError) -> Self {
+        Self::Library(e)
+    }
+}
+
 /// One dictionary's part of an [`Article`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArticleSection {
@@ -765,8 +917,13 @@ pub struct ArticleSection {
     /// Whether the dictionary's JavaScript may run: see
     /// [`Library::set_allow_scripts`].
     pub allow_scripts: bool,
+    /// The headword whose entries are shown, when the one looked up
+    /// redirects there (`went` → `go`): the final target, after every hop.
+    /// `None` when the entries (or some of them) are the headword's own.
+    pub redirect: Option<String>,
     /// The raw HTML of each entry, in file order, or why the dictionary
-    /// could not be read (e.g. its file has gone).
+    /// could not be read (e.g. its file has gone) or its entries are all
+    /// broken redirects.
     pub entries: Result<Vec<String>, String>,
 }
 

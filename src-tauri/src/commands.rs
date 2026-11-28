@@ -359,6 +359,9 @@ pub struct ArticleSection {
     pub dictionary_title: String,
     /// Whether the dictionary's JavaScript may run in its frame.
     pub allow_scripts: bool,
+    /// The headword whose entries are shown, when the one looked up
+    /// redirects there (`went` -> `go`).
+    pub redirect: Option<String>,
     pub entries: Vec<String>,
     pub error: Option<String>,
 }
@@ -377,6 +380,7 @@ impl From<library::Article> for Article {
                     dictionary_id: section.dictionary_id.to_raw(),
                     dictionary_title: section.dictionary_title,
                     allow_scripts: section.allow_scripts,
+                    redirect: section.redirect,
                     entries,
                     error,
                 }

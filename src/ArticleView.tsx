@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
+import { anchorTarget, entryLink } from "./links";
 import { RESOURCE_BASE, resolveResources } from "./resources";
 import { playSound, soundPath } from "./sound";
 import { strings } from "./strings";
@@ -11,11 +12,13 @@ interface Props {
   headword: string;
   /** Bumped when the library changes, so the article is fetched again. */
   libraryVersion: number;
+  /** An entry link (`entry://word`) in the article was followed. */
+  onOpenEntry: (word: string) => void;
 }
 
 type Loaded = { headword: string } & ({ article: api.Article } | { error: string });
 
-export function ArticleView({ headword, libraryVersion }: Props) {
+export function ArticleView({ headword, libraryVersion, onOpenEntry }: Props) {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [settingError, setSettingError] = useState<string | null>(null);
   // A pronunciation that couldn't play, until dismissed or the next one.
@@ -34,15 +37,26 @@ export function ArticleView({ headword, libraryVersion }: Props) {
 
   useEffect(() => setSoundError(null), [headword]);
 
-  const onSoundLink = useCallback((dictionaryId: number, href: string) => {
-    const path = soundPath(href);
-    if (path === null) return;
-    setSoundError(null);
-    void playSound(dictionaryId, path).then((outcome) => {
-      if (outcome === "notFound") setSoundError(strings.soundNotFound(path));
-      else if (outcome === "unsupported") setSoundError(strings.soundUnsupported(path));
-    });
-  }, []);
+  // A sound or entry link clicked in a frame. Anchors within the article
+  // (`entry://#name`) never get here: the frames scroll to them.
+  const latestOnOpenEntry = useLatest(onOpenEntry);
+  const onLink = useCallback(
+    (dictionaryId: number, href: string) => {
+      const link = entryLink(href);
+      if (link !== null) {
+        if ("word" in link) latestOnOpenEntry.current(link.word);
+        return;
+      }
+      const path = soundPath(href);
+      if (path === null) return;
+      setSoundError(null);
+      void playSound(dictionaryId, path).then((outcome) => {
+        if (outcome === "notFound") setSoundError(strings.soundNotFound(path));
+        else if (outcome === "unsupported") setSoundError(strings.soundUnsupported(path));
+      });
+    },
+    [latestOnOpenEntry],
+  );
 
   // The setting only changes how sections render, so update them in place
   // rather than refetching the article.
@@ -62,11 +76,20 @@ export function ArticleView({ headword, libraryVersion }: Props) {
       .catch((e) => setSettingError(strings.settingFailed(String(e))));
   };
 
+  // Where redirects led: in the heading when every section went to the same
+  // word, else in each redirected section's header.
+  const sections = loaded !== null && "article" in loaded ? loaded.article.sections : [];
+  const firstRedirect = sections[0]?.redirect ?? null;
+  const commonRedirect = sections.every((s) => s.redirect === firstRedirect) ? firstRedirect : null;
+  const shownHeadword = loaded?.headword ?? headword;
+
   // Until the new article arrives, keep showing the previous one rather than
   // flashing an empty pane.
   return (
     <article className="article">
-      <h1 className="article-headword">{loaded?.headword ?? headword}</h1>
+      <h1 className="article-headword">
+        {commonRedirect === null ? shownHeadword : strings.redirect(shownHeadword, commonRedirect)}
+      </h1>
       {settingError !== null && <p className="article-error">{settingError}</p>}
       {loaded === null ? null : "error" in loaded ? (
         <p className="article-error">{strings.articleFailed(loaded.error)}</p>
@@ -76,7 +99,14 @@ export function ArticleView({ headword, libraryVersion }: Props) {
         loaded.article.sections.map((section) => (
           <section className="article-section" key={section.dictionaryId}>
             <header className="article-section-header">
-              <h2 className="article-dictionary">{section.dictionaryTitle}</h2>
+              <h2 className="article-dictionary">
+                {section.dictionaryTitle}
+                {commonRedirect === null && section.redirect !== null && (
+                  <span className="article-section-redirect">
+                    {strings.redirect(shownHeadword, section.redirect)}
+                  </span>
+                )}
+              </h2>
               {section.error === null && (
                 <label className="allow-scripts" title={strings.allowScriptsHint}>
                   <input
@@ -96,7 +126,7 @@ export function ArticleView({ headword, libraryVersion }: Props) {
                 dictionaryId={section.dictionaryId}
                 entries={section.entries}
                 allowScripts={section.allowScripts}
-                onSoundLink={onSoundLink}
+                onLink={onLink}
               />
             )}
           </section>
@@ -122,38 +152,113 @@ body { margin: 8px; font-family: system-ui, "Segoe UI", Roboto, Helvetica, Arial
 </style>`;
 
 // Message types a scripted frame posts: its content height, and a click on
-// a `sound://` link.
+// a link the app handles (`sound://`, `entry://`, `bword://`).
 const HEIGHT_MESSAGE = "ultra-dict:height";
-const SOUND_MESSAGE = "ultra-dict:sound";
+const LINK_MESSAGE = "ultra-dict:link";
+// A back/forward key or mouse button pressed in a scripted frame.
+const INPUT_MESSAGE = "ultra-dict:input";
 
-// The `sound://` link a click landed on, if any. Duck-typed: in a
-// scripts-off frame the target belongs to the frame's realm, where
-// `instanceof Element` fails.
-function soundLinkOf(event: Event): string | null {
+/** A key press or mouse button event, copied out of a frame. */
+interface FrameInput {
+  type: "keydown" | "mousedown" | "mouseup";
+  key: string;
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  shiftKey: boolean;
+  button: number;
+}
+
+/**
+ * Replays `input` on the app window, whose listeners handle back/forward
+ * (events in a frame never reach them). Returns whether a listener claimed
+ * it, so the frame's own event can be cancelled too.
+ */
+function forwardInput(input: FrameInput): boolean {
+  const { type, ...init } = input;
+  const event =
+    type === "keydown"
+      ? new KeyboardEvent(type, { ...init, cancelable: true })
+      : new MouseEvent(type, { ...init, cancelable: true });
+  window.dispatchEvent(event);
+  return event.defaultPrevented;
+}
+
+/** `value` as a `FrameInput`, if it is a well-formed one. */
+function asFrameInput(value: unknown): FrameInput | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const ok =
+    (v.type === "keydown" || v.type === "mousedown" || v.type === "mouseup") &&
+    typeof v.key === "string" &&
+    v.key.length <= 32 &&
+    typeof v.button === "number" &&
+    ["altKey", "ctrlKey", "metaKey", "shiftKey"].every((k) => typeof v[k] === "boolean");
+  return ok ? (v as unknown as FrameInput) : null;
+}
+
+// The link a click landed on, if any. Duck-typed: in a scripts-off frame the
+// target belongs to the frame's realm, where `instanceof Element` fails.
+function linkOf(event: Event): string | null {
   const target = event.target as Partial<Element> | null;
   const anchor = typeof target?.closest === "function" ? target.closest("a[href]") : null;
-  const href = anchor?.getAttribute("href") ?? null;
-  return href !== null && soundPath(href) !== null ? href : null;
+  return anchor?.getAttribute("href") ?? null;
+}
+
+// Links the app handles instead of the frame: sounds play in the app
+// window, and entry links open another headword.
+function isAppLink(href: string): boolean {
+  return soundPath(href) !== null || entryLink(href) !== null;
 }
 
 // Runs first in a scripted frame: the parent can't look into an opaque-origin
-// document, so the document reports its own height and its sound clicks.
+// document, so the document reports its own height and its link clicks.
 const FRAME_SCRIPT = `<script>(() => {
   const root = document.documentElement;
   const report = () => parent.postMessage(
     { type: "${HEIGHT_MESSAGE}", height: Math.ceil(root.getBoundingClientRect().height) }, "*");
   new ResizeObserver(report).observe(root);
   addEventListener("load", report);
-  // Sounds play in the app window: hand it the link instead of navigating
-  // the frame to a scheme it can't load. Capture phase on the window, so
-  // this runs before the dictionary's own handlers.
+  // Sounds and entry links are the app's: hand it the link instead of
+  // navigating the frame to a scheme it can't load. A link to an anchor in
+  // this article (entry://#name) scrolls to it here. Capture phase on the
+  // window, so this runs before the dictionary's own handlers.
   addEventListener("click", (event) => {
     const anchor = event.target instanceof Element ? event.target.closest("a[href]") : null;
     const href = anchor && anchor.getAttribute("href");
-    if (!href || !/^\\s*sound:\\/\\//i.test(href)) return;
+    if (!href || !/^\\s*(?:sound|entry|bword):\\/\\//i.test(href)) return;
     event.preventDefault();
-    parent.postMessage({ type: "${SOUND_MESSAGE}", href }, "*");
+    // Mirrors entryLink() and anchorTarget() in links.ts.
+    const local = /^\\s*(?:entry|bword):\\/\\/#(.+)$/is.exec(href);
+    if (local) {
+      let name = local[1].trim();
+      try { name = decodeURIComponent(name); } catch {}
+      const target = document.getElementById(name) || document.getElementsByName(name)[0];
+      if (target) target.scrollIntoView();
+      return;
+    }
+    parent.postMessage({ type: "${LINK_MESSAGE}", href }, "*");
   }, true);
+  // Back/forward keys and mouse buttons are the app's too; the webview must
+  // not take them as history steps within this frame.
+  const forward = (event) => {
+    event.preventDefault();
+    const { type, key = "", altKey = false, ctrlKey = false, metaKey = false, shiftKey = false,
+      button = 0 } = event;
+    parent.postMessage(
+      { type: "${INPUT_MESSAGE}", input: { type, key, altKey, ctrlKey, metaKey, shiftKey, button } }, "*");
+  };
+  addEventListener("keydown", (event) => {
+    const k = event.key;
+    if (k === "BrowserBack" || k === "BrowserForward" ||
+        (event.altKey && (k === "ArrowLeft" || k === "ArrowRight")) ||
+        (event.metaKey && (k === "[" || k === "]"))) forward(event);
+  }, true);
+  for (const type of ["mousedown", "mouseup"]) {
+    addEventListener(type, (event) => {
+      if (event.button === 3 || event.button === 4) forward(event);
+    }, true);
+  }
 })();</script>`;
 
 // Second layer for a scripted frame, after the opaque origin: its scripts
@@ -190,8 +295,8 @@ interface FrameProps {
   dictionaryId: number;
   entries: string[];
   allowScripts: boolean;
-  /** A `sound://` link in the frame was clicked. */
-  onSoundLink: (dictionaryId: number, href: string) => void;
+  /** A sound or entry link in the frame was clicked. */
+  onLink: (dictionaryId: number, href: string) => void;
 }
 
 /**
@@ -209,27 +314,30 @@ interface FrameProps {
  * Toggling renders the other component, so the frame is recreated: a
  * sandbox change only applies to a new document anyway.
  */
-function EntryFrame({ title, dictionaryId, entries, allowScripts, onSoundLink }: FrameProps) {
+function EntryFrame({ title, dictionaryId, entries, allowScripts, onLink }: FrameProps) {
   const srcDoc = useMemo(
     () => frameDocument(dictionaryId, entries, allowScripts),
     [dictionaryId, entries, allowScripts],
   );
-  const onSound = useCallback(
-    (href: string) => onSoundLink(dictionaryId, href),
-    [onSoundLink, dictionaryId],
+  const onFrameLink = useCallback(
+    (href: string) => onLink(dictionaryId, href),
+    [onLink, dictionaryId],
   );
   return allowScripts ? (
-    <ScriptedFrame title={title} srcDoc={srcDoc} onSound={onSound} />
+    <ScriptedFrame title={title} srcDoc={srcDoc} onLink={onFrameLink} />
   ) : (
-    <StaticFrame title={title} srcDoc={srcDoc} onSound={onSound} />
+    <StaticFrame title={title} srcDoc={srcDoc} onLink={onFrameLink} />
   );
 }
 
 interface DocumentFrameProps {
   title: string;
   srcDoc: string;
-  /** A `sound://` link in the frame was clicked. */
-  onSound: (href: string) => void;
+  /**
+   * A sound or entry link in the frame was clicked. Links to an anchor in
+   * the same article (`entry://#name`) are handled in the frame.
+   */
+  onLink: (href: string) => void;
 }
 
 /** A ref holding the latest render's `value`, for long-lived listeners. */
@@ -243,13 +351,13 @@ function useLatest<T>(value: T) {
 
 /**
  * Scripts off: measured directly through the shared origin, which also lets
- * this component catch clicks on `sound://` links. The listener is the
+ * this component catch clicks on sound and entry links. The listener is the
  * app's code, so it runs although the frame's own scripts can't.
  */
-function StaticFrame({ title, srcDoc, onSound }: DocumentFrameProps) {
+function StaticFrame({ title, srcDoc, onLink }: DocumentFrameProps) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(0);
-  const latestOnSound = useLatest(onSound);
+  const latestOnLink = useLatest(onLink);
 
   useEffect(() => {
     const frame = ref.current;
@@ -264,27 +372,52 @@ function StaticFrame({ title, srcDoc, onSound }: DocumentFrameProps) {
     observer.observe(frame);
     let observedRoot: Element | null = null;
     const onClick = (event: MouseEvent) => {
-      const href = soundLinkOf(event);
-      if (href === null) return;
+      const href = linkOf(event);
+      if (href === null || !isAppLink(href)) return;
       event.preventDefault();
-      latestOnSound.current(href);
+      const link = entryLink(href);
+      if (link !== null && "anchor" in link) {
+        const doc = frame.contentDocument;
+        if (doc) anchorTarget(doc, link.anchor)?.scrollIntoView();
+        return;
+      }
+      latestOnLink.current(href);
     };
+    // Back/forward keys and mouse buttons pressed over the article.
+    const onInput = (event: Event) => {
+      const e = event as KeyboardEvent & MouseEvent;
+      const input = {
+        type: event.type as FrameInput["type"],
+        key: e.key ?? "",
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey,
+        button: e.button ?? 0,
+      };
+      if (forwardInput(input)) event.preventDefault();
+    };
+    const INPUT_EVENTS = ["keydown", "mousedown", "mouseup"];
     const onLoad = () => {
-      // A new article is a new document: watch its root and its clicks
-      // instead. The old listener goes with the old document.
+      // A new article is a new document: watch its root and its events
+      // instead. The old listeners go with the old document.
       if (observedRoot) observer.unobserve(observedRoot);
-      observedRoot = frame.contentDocument?.documentElement ?? null;
+      const doc = frame.contentDocument;
+      observedRoot = doc?.documentElement ?? null;
       if (observedRoot) observer.observe(observedRoot);
-      frame.contentDocument?.addEventListener("click", onClick);
+      doc?.addEventListener("click", onClick);
+      for (const type of INPUT_EVENTS) doc?.addEventListener(type, onInput);
       measure();
     };
     frame.addEventListener("load", onLoad);
     return () => {
       observer.disconnect();
       frame.removeEventListener("load", onLoad);
-      frame.contentDocument?.removeEventListener("click", onClick);
+      const doc = frame.contentDocument;
+      doc?.removeEventListener("click", onClick);
+      for (const type of INPUT_EVENTS) doc?.removeEventListener(type, onInput);
     };
-  }, [latestOnSound]);
+  }, [latestOnLink]);
 
   return (
     <iframe
@@ -306,29 +439,44 @@ const MAX_LINK_LENGTH = 4096;
 
 /**
  * Scripts on: opaque origin; the frame reports its own height and its
- * `sound://` clicks. Only this frame's messages count, and the link can
- * only name a resource of this frame's dictionary.
+ * sound and entry link clicks. Only this frame's messages count, and the
+ * most a link can do is play a resource of this frame's dictionary or look
+ * a word up.
  */
-function ScriptedFrame({ title, srcDoc, onSound }: DocumentFrameProps) {
+function ScriptedFrame({ title, srcDoc, onLink }: DocumentFrameProps) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(0);
-  const latestOnSound = useLatest(onSound);
+  const latestOnLink = useLatest(onLink);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       if (event.source === null || event.source !== ref.current?.contentWindow) return;
       const data: unknown = event.data;
       if (typeof data !== "object" || data === null) return;
-      const { type, height, href } = data as { type?: unknown; height?: unknown; href?: unknown };
+      const { type, height, href, input } = data as {
+        type?: unknown;
+        height?: unknown;
+        href?: unknown;
+        input?: unknown;
+      };
       if (type === HEIGHT_MESSAGE && typeof height === "number" && Number.isFinite(height)) {
         setHeight(Math.min(Math.max(Math.ceil(height), 0), MAX_FRAME_HEIGHT));
-      } else if (type === SOUND_MESSAGE && typeof href === "string" && href.length <= MAX_LINK_LENGTH) {
-        latestOnSound.current(href);
+      } else if (type === INPUT_MESSAGE) {
+        // At most a step back or forward, whatever the frame sends.
+        const frameInput = asFrameInput(input);
+        if (frameInput !== null) forwardInput(frameInput);
+      } else if (
+        type === LINK_MESSAGE &&
+        typeof href === "string" &&
+        href.length <= MAX_LINK_LENGTH &&
+        isAppLink(href)
+      ) {
+        latestOnLink.current(href);
       }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [latestOnSound]);
+  }, [latestOnLink]);
 
   return (
     <iframe

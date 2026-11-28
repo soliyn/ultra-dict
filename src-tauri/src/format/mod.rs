@@ -45,8 +45,17 @@ pub trait Dictionary: Send + Sync {
 
     /// The raw article HTML of the entry at `locator`.
     ///
-    /// Redirects (MDict `@@@LINK=target`) are returned as-is, not followed.
+    /// Redirects (MDict `@@@LINK=target`) are returned as-is, not followed:
+    /// see [`Dictionary::redirect_target`].
     fn entry(&self, locator: EntryLocator) -> Result<String, FormatError>;
+
+    /// The headword that `entry` (as [`Dictionary::entry`] returned it)
+    /// redirects to, if it is a redirect rather than an article. Formats
+    /// without redirects keep the default.
+    fn redirect_target<'a>(&self, entry: &'a str) -> Option<&'a str> {
+        let _ = entry;
+        None
+    }
 
     /// The bytes of a resource bundled inside the dictionary's own files,
     /// or `None` if it has none by that name.

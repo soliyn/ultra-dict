@@ -239,6 +239,19 @@ body,
   padding: 16px 24px;
 }
 
+.article-nav {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.article-section-redirect {
+  margin-left: 0.75em;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
 .article-headword {
   margin: 0 0 12px;
   font-size: 1.6rem;

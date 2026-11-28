@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use ultra_dict_lib::library::{
-    Article, DictionaryId, DictionaryInfo, FolderId, FolderScan, IndexEvent, Library, Progress,
+    Article, ArticleSection, DictionaryId, DictionaryInfo, FolderId, FolderScan, IndexEvent, Library, Progress,
     Resource, Status,
 };
 
@@ -405,10 +405,53 @@ fn unknown_headword_gives_an_empty_article() {
     assert_eq!(library.article("ban").unwrap(), Article { sections: vec![] }, "not a prefix match");
 }
 
+// --- redirects ------------------------------------------------------------
+
+/// The one section of `headword`'s article.
+fn only_section(library: &Library, headword: &str) -> ArticleSection {
+    let mut article = library.article(headword).unwrap();
+    assert_eq!(article.sections.len(), 1, "{headword:?}: {article:?}");
+    article.sections.remove(0)
+}
+
 #[test]
-fn redirect_entries_are_returned_as_is() {
+fn a_redirect_is_followed_to_its_target() {
     let (_dir, library) = basic_library();
-    assert_eq!(entries(&library, "went"), ["@@@LINK=go\r\n"]);
+    let section = only_section(&library, "went");
+    assert_eq!(section.redirect.as_deref(), Some("go"));
+    assert_eq!(section.entries, Ok(entries(&library, "go")));
+}
+
+#[test]
+fn an_entry_reached_directly_has_no_redirect() {
+    let (_dir, library) = basic_library();
+    assert_eq!(only_section(&library, "go").redirect, None);
+}
+
+#[test]
+fn a_chain_of_five_redirects_is_followed_to_the_end() {
+    let (_dir, library) = basic_library();
+    let section = only_section(&library, "chain1");
+    assert_eq!(section.redirect.as_deref(), Some("chain6"), "the final target");
+    assert_eq!(section.entries, Ok(entries(&library, "chain6")));
+}
+
+#[test]
+fn a_sixth_redirect_in_a_row_is_refused() {
+    let (_dir, library) = basic_library();
+    let section = only_section(&library, "chain0");
+    let error = section.entries.unwrap_err();
+    assert!(error.contains("more than 5 redirects"), "{error}");
+    assert_eq!(section.redirect, None);
+}
+
+#[test]
+fn redirect_loops_are_refused() {
+    let (_dir, library) = basic_library();
+    for (headword, chain) in [("ping", "ping → pong → ping"), ("self", "self → self")] {
+        let error = only_section(&library, headword).entries.unwrap_err();
+        assert!(error.contains("loop") && error.contains(chain), "{headword}: {error}");
+    }
 }
 
 #[test]
