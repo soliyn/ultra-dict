@@ -22,13 +22,15 @@ use crate::format::{self, Dictionary, EntryLocator, FormatError};
 use fold::fold;
 
 /// Schema version written to `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// `MIGRATIONS[n]` upgrades a schema-version `n + 1` database to `n + 2`.
 /// A new database gets `schema.sql`, which is already the latest version.
 const MIGRATIONS: &[&str] = &[
     // 1 → 2: per-dictionary "Allow scripts".
     "ALTER TABLE dictionaries ADD COLUMN allow_scripts INTEGER NOT NULL DEFAULT 0;",
+    // 2 → 3: the user's own name for a dictionary.
+    "ALTER TABLE dictionaries ADD COLUMN user_title TEXT;",
 ];
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION - 1);
 
@@ -206,7 +208,7 @@ impl Library {
     /// are. A headword no dictionary has gives an article with no sections.
     pub fn article(&self, headword: &str) -> Result<Article, LibraryError> {
         let mut stmt = self.db.prepare_cached(
-            "SELECT d.id, d.title, d.path, d.allow_scripts, h.locator
+            "SELECT d.id, COALESCE(d.user_title, d.title), d.path, d.allow_scripts, h.locator
              FROM headwords h JOIN dictionaries d ON d.id = h.dictionary_id
              WHERE h.folded = ?1 AND h.headword = ?2 AND d.enabled AND d.status = 'ready'
              ORDER BY d.position, d.id, h.locator",
@@ -265,10 +267,71 @@ impl Library {
         id: DictionaryId,
         allow: bool,
     ) -> Result<DictionaryInfo, LibraryError> {
-        let changed = self
-            .db
-            .prepare_cached("UPDATE dictionaries SET allow_scripts = ?2 WHERE id = ?1")?
-            .execute(params![id.0, allow])?;
+        self.update(id, "UPDATE dictionaries SET allow_scripts = ?2 WHERE id = ?1", allow)
+    }
+
+    /// Includes dictionary `id` in search and articles, or leaves it out
+    /// while keeping it in the library. New dictionaries start enabled.
+    pub fn set_enabled(
+        &mut self,
+        id: DictionaryId,
+        enabled: bool,
+    ) -> Result<DictionaryInfo, LibraryError> {
+        self.update(id, "UPDATE dictionaries SET enabled = ?2 WHERE id = ?1", enabled)
+    }
+
+    /// Moves dictionary `id` to `position` in the library order (0 is first;
+    /// past the end means last), shifting the others, and returns the new
+    /// listing. The order drives the order of article sections.
+    pub fn move_dictionary(
+        &mut self,
+        id: DictionaryId,
+        position: u32,
+    ) -> Result<Vec<DictionaryInfo>, LibraryError> {
+        let tx = self.db.transaction()?;
+        let mut order = library_order(&tx)?;
+        let from = order
+            .iter()
+            .position(|&d| d == id)
+            .ok_or(LibraryError::UnknownDictionary(id))?;
+        order.remove(from);
+        order.insert((position as usize).min(order.len()), id);
+        write_order(&tx, &order)?;
+        tx.commit()?;
+        self.dictionaries()
+    }
+
+    /// Takes dictionary `id` out of the library, with its index and settings,
+    /// and returns the new listing. The file itself is left alone; adding it
+    /// again starts afresh.
+    pub fn remove(&mut self, id: DictionaryId) -> Result<Vec<DictionaryInfo>, LibraryError> {
+        let tx = self.db.transaction()?;
+        // Headwords go with it (ON DELETE CASCADE).
+        if tx.execute("DELETE FROM dictionaries WHERE id = ?1", [id.0])? == 0 {
+            return Err(LibraryError::UnknownDictionary(id));
+        }
+        write_order(&tx, &library_order(&tx)?)?;
+        tx.commit()?;
+        self.lock_readers().remove(&id);
+        self.dictionaries()
+    }
+
+    /// Gives dictionary `id` the display name `name` (trimmed), in place of
+    /// the title from its file. An empty name restores the file's title.
+    /// The name is the user's: reindexing the file doesn't change it.
+    pub fn rename(&mut self, id: DictionaryId, name: &str) -> Result<DictionaryInfo, LibraryError> {
+        let name = Some(name.trim()).filter(|n| !n.is_empty());
+        self.update(id, "UPDATE dictionaries SET user_title = ?2 WHERE id = ?1", name)
+    }
+
+    /// Runs `sql` (an `UPDATE` of row `?1` setting `?2`) on dictionary `id`.
+    fn update(
+        &mut self,
+        id: DictionaryId,
+        sql: &str,
+        value: impl rusqlite::ToSql,
+    ) -> Result<DictionaryInfo, LibraryError> {
+        let changed = self.db.prepare_cached(sql)?.execute(params![id.0, value])?;
         if changed == 0 {
             return Err(LibraryError::UnknownDictionary(id));
         }
@@ -419,6 +482,22 @@ fn insert_dictionary(
     Ok(DictionaryId(tx.last_insert_rowid()))
 }
 
+/// Every dictionary id, in library order.
+fn library_order(tx: &Transaction<'_>) -> Result<Vec<DictionaryId>, LibraryError> {
+    let mut stmt = tx.prepare_cached("SELECT id FROM dictionaries ORDER BY position, id")?;
+    let ids = stmt.query_map([], |row| row.get(0).map(DictionaryId))?;
+    Ok(ids.collect::<Result<_, _>>()?)
+}
+
+/// Numbers the dictionaries `0, 1, …` in the order of `ids`.
+fn write_order(tx: &Transaction<'_>, ids: &[DictionaryId]) -> Result<(), LibraryError> {
+    let mut stmt = tx.prepare_cached("UPDATE dictionaries SET position = ?2 WHERE id = ?1")?;
+    for (position, id) in ids.iter().enumerate() {
+        stmt.execute(params![id.0, to_sql_int(position)])?;
+    }
+    Ok(())
+}
+
 /// SQL condition: headword row `h` belongs to a searchable dictionary.
 ///
 /// The unary `+` stops SQLite from driving the query by the
@@ -470,12 +549,15 @@ pub struct SearchPage {
 }
 
 const SELECT_INFO: &str = "
-    SELECT d.id, d.path, d.title, d.position, d.enabled, d.file_size, d.file_mtime_ns,
-           d.status, d.error, d.allow_scripts,
+    SELECT d.id, d.path, COALESCE(d.user_title, d.title), d.title, d.position, d.enabled,
+           d.file_size, d.file_mtime_ns, d.status, d.error, d.allow_scripts,
            (SELECT COUNT(*) FROM headwords h WHERE h.dictionary_id = d.id)
     FROM dictionaries d";
 
 /// Identifies a dictionary within one library.
+///
+/// Once a dictionary is removed, a later one may get its id. Callers holding
+/// ids (open articles, `dict://` URLs) refetch after every library change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DictionaryId(i64);
 
@@ -505,8 +587,11 @@ pub struct DictionaryInfo {
     pub id: DictionaryId,
     /// Absolute path of the dictionary file.
     pub path: PathBuf,
-    /// Display name.
+    /// Display name: the user's rename, else [`file_title`](Self::file_title).
     pub title: String,
+    /// The title read from the file (HTML stripped, falling back to the
+    /// file name).
+    pub file_title: String,
     /// Place in the library order (0 is first).
     pub position: u32,
     pub enabled: bool,
@@ -523,16 +608,17 @@ pub struct DictionaryInfo {
 
 impl DictionaryInfo {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        let size: Option<i64> = row.get(5)?;
-        let mtime_ns: Option<i64> = row.get(6)?;
-        let status: String = row.get(7)?;
-        let error: Option<String> = row.get(8)?;
+        let size: Option<i64> = row.get(6)?;
+        let mtime_ns: Option<i64> = row.get(7)?;
+        let status: String = row.get(8)?;
+        let error: Option<String> = row.get(9)?;
         Ok(Self {
             id: DictionaryId(row.get(0)?),
             path: PathBuf::from(row.get::<_, String>(1)?),
             title: row.get(2)?,
-            position: row.get(3)?,
-            enabled: row.get(4)?,
+            file_title: row.get(3)?,
+            position: row.get(4)?,
+            enabled: row.get(5)?,
             file: size.zip(mtime_ns).map(|(size, ns)| FileStamp {
                 size: size as u64,
                 modified: UNIX_EPOCH + Duration::from_nanos(ns as u64),
@@ -541,8 +627,8 @@ impl DictionaryInfo {
                 "ready" => Status::Ready,
                 _ => Status::Error(error.unwrap_or(status)),
             },
-            allow_scripts: row.get(9)?,
-            headword_count: row.get::<_, i64>(10)? as u64,
+            allow_scripts: row.get(10)?,
+            headword_count: row.get::<_, i64>(11)? as u64,
         })
     }
 }

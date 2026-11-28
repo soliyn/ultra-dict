@@ -141,7 +141,7 @@ body,
   border-top: 1px solid var(--border);
 }
 
-.add-file {
+.button {
   padding: 6px 10px;
   font: inherit;
   color: var(--fg);
@@ -151,17 +151,48 @@ body,
   white-space: nowrap;
 }
 
-.add-file:hover:not(:disabled) {
+.button:hover:not(:disabled) {
   background: var(--row-hover);
 }
 
-.add-file:focus-visible {
+.button:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 1px;
 }
 
-.add-file:disabled {
+.button:disabled {
   color: var(--fg-muted);
+}
+
+.button.pressed {
+  background: var(--row-hover);
+  border-color: var(--fg-muted);
+}
+
+.button.danger {
+  color: var(--error-fg);
+  border-color: var(--error-border);
+}
+
+.button.icon {
+  min-width: 2em;
+  padding: 6px 4px;
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--focus);
 }
 
 .notice {
@@ -257,4 +288,76 @@ body,
   border: 1px solid var(--border);
   border-radius: 4px;
   background: #fff;
+}
+
+/* --- dictionary list (LibraryView.tsx) --------------------------------- */
+
+.library-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.library-title {
+  flex: 1;
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+
+.library-header + .notice {
+  margin: 0 0 12px;
+}
+
+.library-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.library-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.library-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.library-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-row.disabled .library-name {
+  color: var(--fg-muted);
+}
+
+.library-status {
+  font-size: 0.8rem;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
+.library-status.error {
+  color: var(--error-fg);
+}
+
+.library-rename {
+  display: flex;
+  gap: 6px;
+}
+
+.library-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }

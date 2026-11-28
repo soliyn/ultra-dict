@@ -58,6 +58,62 @@ pub async fn set_allow_scripts(
     with_library(&library, |lib| lib.set_allow_scripts(id, allow)).map(DictionaryInfo::from)
 }
 
+/// Every dictionary, in library order.
+#[tauri::command]
+pub async fn dictionaries(library: State<'_, SharedLibrary>) -> Result<Vec<DictionaryInfo>, String> {
+    with_library(&library, |lib| lib.dictionaries()).map(list)
+}
+
+/// Includes a dictionary in search and articles, or leaves it out.
+#[tauri::command]
+pub async fn set_enabled(
+    library: State<'_, SharedLibrary>,
+    dictionary_id: i64,
+    enabled: bool,
+) -> Result<DictionaryInfo, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    with_library(&library, |lib| lib.set_enabled(id, enabled)).map(DictionaryInfo::from)
+}
+
+/// Gives a dictionary the user's own name; an empty name restores the
+/// file's title.
+#[tauri::command]
+pub async fn rename_dictionary(
+    library: State<'_, SharedLibrary>,
+    dictionary_id: i64,
+    name: String,
+) -> Result<DictionaryInfo, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    with_library(&library, |lib| lib.rename(id, &name)).map(DictionaryInfo::from)
+}
+
+/// Moves a dictionary to `position` in the library order; returns the new
+/// listing.
+#[tauri::command]
+pub async fn move_dictionary(
+    library: State<'_, SharedLibrary>,
+    dictionary_id: i64,
+    position: u32,
+) -> Result<Vec<DictionaryInfo>, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    with_library(&library, |lib| lib.move_dictionary(id, position)).map(list)
+}
+
+/// Takes a dictionary out of the library (the file stays); returns the new
+/// listing.
+#[tauri::command]
+pub async fn remove_dictionary(
+    library: State<'_, SharedLibrary>,
+    dictionary_id: i64,
+) -> Result<Vec<DictionaryInfo>, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    with_library(&library, |lib| lib.remove(id)).map(list)
+}
+
+fn list(infos: Vec<library::DictionaryInfo>) -> Vec<DictionaryInfo> {
+    infos.into_iter().map(DictionaryInfo::from).collect()
+}
+
 fn with_library<T>(
     library: &SharedLibrary,
     call: impl FnOnce(&mut Library) -> Result<T, LibraryError>,
@@ -72,7 +128,10 @@ fn with_library<T>(
 pub struct DictionaryInfo {
     pub id: i64,
     pub path: String,
+    /// Display name: the user's rename, else `file_title`.
     pub title: String,
+    /// The title read from the file.
+    pub file_title: String,
     pub position: u32,
     pub enabled: bool,
     /// `"ready"` or `"error"`.
@@ -93,6 +152,7 @@ impl From<library::DictionaryInfo> for DictionaryInfo {
             id: info.id.to_raw(),
             path: info.path.to_string_lossy().into_owned(),
             title: info.title,
+            file_title: info.file_title,
             position: info.position,
             enabled: info.enabled,
             status,
