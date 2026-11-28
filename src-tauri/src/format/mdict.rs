@@ -112,6 +112,16 @@ impl Dictionary for MdictDictionary {
         }
         Ok(None)
     }
+
+    fn redirect_target<'a>(&self, entry: &'a str) -> Option<&'a str> {
+        redirect_target(entry)
+    }
+}
+
+/// The headword an MDict redirect entry (`@@@LINK=target`) points to.
+fn redirect_target(entry: &str) -> Option<&str> {
+    let target = entry.trim_start().strip_prefix("@@@LINK=")?.trim();
+    (!target.is_empty()).then_some(target)
 }
 
 /// `dir/name.mdx` → `[dir/name.mdd, dir/name.1.mdd, dir/name.2.mdd, …]`,
@@ -154,6 +164,16 @@ fn convert_error(error: mdictlib::Error) -> FormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_entries_name_their_target() {
+        assert_eq!(redirect_target("@@@LINK=go
+"), Some("go"));
+        assert_eq!(redirect_target("@@@LINK=go on"), Some("go on"));
+        assert_eq!(redirect_target("@@@LINK=
+"), None);
+        assert_eq!(redirect_target("<b>go</b> see @@@LINK=went"), None);
+    }
 
     #[test]
     fn resource_paths_become_mdd_keys() {

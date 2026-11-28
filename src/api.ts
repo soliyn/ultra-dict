@@ -66,6 +66,11 @@ export interface ArticleSection {
   dictionaryTitle: string;
   /** Whether the dictionary's JavaScript may run in its frame. */
   allowScripts: boolean;
+  /**
+   * The headword whose entries are shown, when the one looked up redirects
+   * there (`went` → `go`); null when they are its own.
+   */
+  redirect: string | null;
   /** Raw entry HTML, in file order. Empty when `error` is set. */
   entries: string[];
   error: string | null;

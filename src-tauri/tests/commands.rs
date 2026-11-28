@@ -153,12 +153,23 @@ fn article_returns_sections_with_entries() {
     assert_eq!(section["dictionaryTitle"], "Basic Test Dictionary");
     assert_eq!(section["error"], Value::Null);
     assert_eq!(section["allowScripts"], false);
+    assert_eq!(section["redirect"], Value::Null);
     let entries = section["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
     assert!(entries[0].as_str().unwrap().contains("<sup>1</sup>"));
 
     let unknown = app.invoke("article", json!({ "headword": "nope" })).unwrap();
     assert_eq!(unknown, json!({ "sections": [] }));
+}
+
+#[test]
+fn article_follows_redirects() {
+    let app = TestApp::new();
+    app.add("basic/basic.mdx");
+    let article = app.invoke("article", json!({ "headword": "went" })).unwrap();
+    let section = &article["sections"][0];
+    assert_eq!(section["redirect"], "go");
+    assert!(section["entries"][0].as_str().unwrap().contains("<b>go</b>"));
 }
 
 #[test]
