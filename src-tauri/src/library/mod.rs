@@ -244,6 +244,107 @@ impl Library {
         self.get(id)
     }
 
+    /// Brings the library in line with the files on disk; run it at startup.
+    /// Returns the dictionaries it changed, in library order.
+    ///
+    /// Each dictionary's file is compared with the size and modification
+    /// time recorded when it was indexed. A file that changed is queued for
+    /// reindexing ([`Status::Indexing`]), whether its dictionary was ready or
+    /// had failed, as is one that is back after being missing. A file that is
+    /// gone gets [`Status::Missing`] and loses its headwords. Settings (name,
+    /// order, enabled, scripts) are kept either way. Dictionaries waiting to
+    /// be indexed, and those needing reindexing, are only checked for being
+    /// missing. Nothing watches the files in between.
+    pub fn check_files(&mut self) -> Result<Vec<DictionaryInfo>, LibraryError> {
+        /// A dictionary's file as the database records it.
+        struct OnRecord {
+            id: DictionaryId,
+            path: String,
+            status: String,
+            /// Size and modification time (ns) when indexed.
+            stamp: (Option<i64>, Option<i64>),
+        }
+        let rows: Vec<OnRecord> = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT id, path, status, file_size, file_mtime_ns FROM dictionaries
+                 ORDER BY position, id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(OnRecord {
+                    id: DictionaryId(row.get(0)?),
+                    path: row.get(1)?,
+                    status: row.get(2)?,
+                    stamp: (row.get(3)?, row.get(4)?),
+                })
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+
+        let mut changed = Vec::new();
+        let tx = self.db.transaction()?;
+        for OnRecord { id, path, status, stamp } in rows {
+            let now = FileStamp::read(Path::new(&path));
+            let action = match (now, status.as_str()) {
+                (None, "missing") => continue,
+                (None, _) => "missing",
+                (Some(_), "missing") => "indexing",
+                (Some(now), "ready" | "error") => {
+                    if stamp == (Some(now.size as i64), Some(now.modified_ns())) {
+                        continue;
+                    }
+                    "indexing"
+                }
+                (Some(_), _) => continue,
+            };
+            tx.execute(
+                "UPDATE dictionaries SET status = ?2, error = NULL, index_run = index_run + 1
+                 WHERE id = ?1",
+                params![id.0, action],
+            )?;
+            // A missing dictionary isn't searchable; a changed one is read
+            // again from the start.
+            tx.execute("DELETE FROM headwords WHERE dictionary_id = ?1", [id.0])?;
+            changed.push(id);
+        }
+        tx.commit()?;
+
+        let mut readers = self.lock_readers();
+        for id in &changed {
+            readers.remove(id);
+        }
+        drop(readers);
+        changed.into_iter().map(|id| self.get(id)).collect()
+    }
+
+    /// Points dictionary `id` at the file `path` instead (for one that went
+    /// [`Status::Missing`] after being moved, say) and queues it for
+    /// indexing from there. Its settings (name, order, enabled, scripts) are
+    /// kept.
+    ///
+    /// A file that is already in the library as another dictionary is an
+    /// `Err`; relocating to the dictionary's own path just reindexes it.
+    pub fn relocate(&mut self, id: DictionaryId, path: &Path) -> Result<DictionaryInfo, LibraryError> {
+        let path = normalize(path)?;
+        let path_text = path_text(&path)?;
+        if let Some(other) = self.find_by_path(path_text)?.filter(|d| d.id != id) {
+            return Err(LibraryError::AlreadyInLibrary(path, other.title));
+        }
+        let tx = self.db.transaction()?;
+        let changed = tx.execute(
+            "UPDATE dictionaries
+             SET path = ?2, status = 'indexing', error = NULL, index_run = index_run + 1
+             WHERE id = ?1",
+            params![id.0, path_text],
+        )?;
+        if changed == 0 {
+            return Err(LibraryError::UnknownDictionary(id));
+        }
+        tx.execute("DELETE FROM headwords WHERE dictionary_id = ?1", [id.0])?;
+        tx.commit()?;
+        self.lock_readers().remove(&id);
+        self.get(id)
+    }
+
     /// Stops indexing dictionary `id`, whether it is waiting or under way.
     /// It is left with [`Status::NeedsReindex`] and no headwords. A
     /// dictionary that isn't being indexed is left as it is.
@@ -808,6 +909,7 @@ impl DictionaryInfo {
                 "ready" => Status::Ready,
                 "indexing" => Status::Indexing,
                 "needs_reindex" => Status::NeedsReindex,
+                "missing" => Status::Missing,
                 _ => Status::Error(error.unwrap_or(status)),
             },
             allow_scripts: row.get(10)?,
@@ -827,6 +929,9 @@ pub enum Status {
     /// Indexing was cancelled or interrupted, and nothing of it was kept.
     /// See [`Library::reindex`].
     NeedsReindex,
+    /// The file was gone at the last [`Library::check_files`]. Not
+    /// searchable; see [`Library::relocate`].
+    Missing,
     /// Could not be opened or indexed; the message says why
     /// (e.g. `"unsupported: needs registration key"`).
     Error(String),
@@ -874,6 +979,9 @@ pub enum LibraryError {
     /// A folder to add or rescan could not be read (missing, not a folder,
     /// no permission).
     Folder(PathBuf, io::Error),
+    /// The file is already in the library, as the dictionary with this
+    /// display name.
+    AlreadyInLibrary(PathBuf, String),
 }
 
 impl fmt::Display for LibraryError {
@@ -891,6 +999,9 @@ impl fmt::Display for LibraryError {
             Self::UnknownDictionary(id) => write!(f, "no dictionary with id {id} in the library"),
             Self::UnknownFolder(id) => write!(f, "no folder with id {id} in the library"),
             Self::Folder(p, e) => write!(f, "cannot read folder {}: {e}", p.display()),
+            Self::AlreadyInLibrary(p, title) => {
+                write!(f, "{} is already in the library as \"{title}\"", p.display())
+            }
         }
     }
 }

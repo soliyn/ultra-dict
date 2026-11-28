@@ -16,9 +16,10 @@ export interface DictionaryInfo {
   /**
    * `"indexing"`: waiting for or being indexed in the background, not
    * searchable yet (progress comes as `IndexingEvent`s). `"needs_reindex"`:
-   * indexing was stopped or interrupted.
+   * indexing was stopped or interrupted. `"missing"`: the file was gone at
+   * startup (see `relocateDictionary`).
    */
-  status: "indexing" | "ready" | "needs_reindex" | "error";
+  status: "indexing" | "ready" | "needs_reindex" | "missing" | "error";
   /** Why the dictionary can't be used, when `status` is `"error"`. */
   error: string | null;
   /** Whether the dictionary's own JavaScript may run in its articles. */
@@ -135,6 +136,15 @@ export function moveDictionary(dictionaryId: number, position: number): Promise<
 /** Indexes the dictionary again from its file, in the background. */
 export function reindexDictionary(dictionaryId: number): Promise<DictionaryInfo> {
   return invoke("reindex_dictionary", { dictionaryId });
+}
+
+/**
+ * Points the dictionary at another file and indexes it from there in the
+ * background, keeping its name, order and settings. Rejects if that file is
+ * already in the library.
+ */
+export function relocateDictionary(dictionaryId: number, path: string): Promise<DictionaryInfo> {
+  return invoke("relocate_dictionary", { dictionaryId, path });
 }
 
 /** Stops indexing the dictionary; it is left needing reindexing. */

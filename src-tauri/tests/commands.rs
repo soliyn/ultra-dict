@@ -283,3 +283,27 @@ fn reindex_and_cancel_commands() {
         assert_eq!(error, "no dictionary with id 999 in the library", "{cmd}");
     }
 }
+
+#[test]
+fn relocate_dictionary_points_it_at_another_file() {
+    let app = TestApp::new();
+    let id = app.add("basic/basic.mdx")["id"].clone();
+    app.invoke("rename_dictionary", json!({ "dictionaryId": id, "name": "Mine" })).unwrap();
+
+    let path = fixture("multivolume/multi.mdx");
+    let relocating = app
+        .invoke("relocate_dictionary", json!({ "dictionaryId": id, "path": path }))
+        .unwrap();
+    assert_eq!(relocating["status"], "indexing");
+    assert_eq!(Path::new(relocating["path"].as_str().unwrap()), path);
+    app.wait_for_indexing(&id);
+    let info = app.dictionary(&id);
+    assert_eq!((&info["status"], &info["title"]), (&json!("ready"), &json!("Mine")));
+
+    let untitled = app.add("untitled/untitled.mdx");
+    let error = app
+        .invoke("relocate_dictionary", json!({ "dictionaryId": id, "path": untitled["path"] }))
+        .unwrap_err();
+    let taken = untitled["path"].as_str().unwrap();
+    assert_eq!(error, format!("{taken} is already in the library as \"untitled\""));
+}

@@ -1539,3 +1539,214 @@ fn the_background_indexer_indexes_what_it_is_woken_for() {
     wait_until_finished(other);
     assert_eq!(search_all(&library, "n"), ["nameless"]);
 }
+
+// --- startup check and re-locate ------------------------------------------
+
+/// A library on `dir/library.sqlite3` holding `untitled` and, first in
+/// order, a copy of `basic` (with its `.mdd`) in `dir/dicts`, renamed
+/// "Mine" and with scripts on. Both indexed.
+fn library_with_a_copy(dir: &Path) -> (Library, DictionaryInfo) {
+    let mut library = Library::open(&dir.join("library.sqlite3")).unwrap();
+    add(&mut library, "untitled/untitled.mdx");
+    let id = add_copy(&mut library, dir, "dicts", "basic/basic.mdx").id;
+    library.rename(id, "Mine").unwrap();
+    library.set_allow_scripts(id, true).unwrap();
+    library.move_dictionary(id, 0).unwrap();
+    let info = current(&library, id);
+    (library, info)
+}
+
+/// The settings the startup check and re-locating must keep.
+fn settings(info: &DictionaryInfo) -> (String, u32, bool, bool) {
+    (info.title.clone(), info.position, info.enabled, info.allow_scripts)
+}
+
+#[test]
+fn the_startup_check_leaves_unchanged_files_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    add(&mut library, "encrypted/encrypted.mdx");
+    let before = library.dictionaries().unwrap();
+
+    assert_eq!(library.check_files().unwrap(), []);
+    assert_eq!(library.dictionaries().unwrap(), before);
+    assert_eq!(current(&library, basic.id).status, Status::Ready);
+    assert_eq!(search_all(&library, "bank"), ["bank"]);
+}
+
+#[test]
+fn a_changed_file_is_reindexed_with_its_settings_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    library.set_enabled(basic.id, false).unwrap();
+    let basic = current(&library, basic.id);
+    // Another dictionary's content under the same name: size and time change.
+    fs::copy(fixture("untitled/untitled.mdx"), &basic.path).unwrap();
+
+    let changed = library.check_files().unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!((changed[0].id, &changed[0].status), (basic.id, &Status::Indexing));
+    assert_eq!(settings(&changed[0]), settings(&basic));
+
+    index_all(&library);
+    let reindexed = current(&library, basic.id);
+    assert_eq!(reindexed.status, Status::Ready);
+    assert_eq!(settings(&reindexed), settings(&basic));
+    assert_eq!(reindexed.headword_count, 1);
+    let meta = fs::metadata(&basic.path).unwrap();
+    let file = reindexed.file.unwrap();
+    assert_eq!((file.size, file.modified), (meta.len(), meta.modified().unwrap()));
+}
+
+#[test]
+fn a_changed_file_is_not_searchable_until_reindexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    fs::copy(fixture("untitled/untitled.mdx"), &basic.path).unwrap();
+
+    library.check_files().unwrap();
+    assert_eq!(search_all(&library, "bank"), [] as [&str; 0]);
+    assert_eq!(search_all(&library, "nameless"), ["nameless"], "only untitled's own copy");
+    index_all(&library);
+    assert_eq!(search_all(&library, "bank"), [] as [&str; 0]);
+    assert_eq!(section_ids(&library, "nameless")[0], basic.id, "the new content, first in order");
+}
+
+#[test]
+fn a_file_with_only_a_new_modification_time_counts_as_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    let file = fs::File::options().write(true).open(&basic.path).unwrap();
+    file.set_modified(basic.file.unwrap().modified + Duration::from_secs(60)).unwrap();
+    drop(file);
+
+    let changed = library.check_files().unwrap();
+    assert_eq!(changed.iter().map(|d| d.id).collect::<Vec<_>>(), [basic.id]);
+    index_all(&library);
+    assert_eq!(current(&library, basic.id).headword_count, basic.headword_count);
+}
+
+#[test]
+fn a_missing_file_gets_status_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    fs::remove_file(&basic.path).unwrap();
+
+    let changed = library.check_files().unwrap();
+    let missing = current(&library, basic.id);
+    assert_eq!(changed, std::slice::from_ref(&missing));
+    assert_eq!(missing.status, Status::Missing);
+    assert_eq!(missing.headword_count, 0);
+    assert_eq!(missing.path, basic.path);
+    assert_eq!(settings(&missing), settings(&basic));
+    assert_eq!(search_all(&library, "bank"), [] as [&str; 0]);
+    assert_eq!(section_ids(&library, "go"), []);
+    assert_eq!(resource(&library, &missing, "basic.css"), None);
+
+    // Still missing next time: nothing more to change, and it persists.
+    assert_eq!(library.check_files().unwrap(), []);
+    drop(library);
+    let reopened = Library::open(&dir.path().join("library.sqlite3")).unwrap();
+    assert_eq!(current(&reopened, basic.id).status, Status::Missing);
+}
+
+#[test]
+fn a_missing_file_that_is_back_is_reindexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    let aside = dir.path().join("aside.mdx");
+    fs::rename(&basic.path, &aside).unwrap();
+    library.check_files().unwrap();
+    fs::rename(&aside, &basic.path).unwrap();
+
+    let changed = library.check_files().unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].status, Status::Indexing);
+    index_all(&library);
+    let back = current(&library, basic.id);
+    assert_eq!(back.status, Status::Ready);
+    assert_eq!(settings(&back), settings(&basic));
+    assert_eq!(search_all(&library, "bank"), ["bank"]);
+}
+
+#[test]
+fn a_failed_dictionary_whose_file_changed_is_tried_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut library = Library::open(&dir.path().join("library.sqlite3")).unwrap();
+    let path = dir.path().join("dict.mdx");
+    fs::copy(fixture("damaged/damaged.mdx"), &path).unwrap();
+    let failed = add_path(&mut library, &path);
+    assert!(matches!(failed.status, Status::Error(_)), "{:?}", failed.status);
+
+    fs::copy(fixture("basic/basic.mdx"), &path).unwrap();
+    library.check_files().unwrap();
+    index_all(&library);
+    assert_eq!(current(&library, failed.id).status, Status::Ready);
+}
+
+#[test]
+fn the_startup_check_leaves_waiting_and_stopped_dictionaries_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    let untitled = library.dictionaries().unwrap()[1].id;
+    library.reindex(basic.id).unwrap();
+    library.reindex(untitled).unwrap();
+    library.cancel_indexing(untitled).unwrap();
+    fs::copy(fixture("untitled/untitled.mdx"), &basic.path).unwrap();
+
+    assert_eq!(library.check_files().unwrap(), []);
+    assert_eq!(current(&library, basic.id).status, Status::Indexing);
+    assert_eq!(current(&library, untitled).status, Status::NeedsReindex);
+}
+
+#[test]
+fn relocating_a_missing_dictionary_keeps_its_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (library, basic) = library_with_a_copy(dir.path());
+    // Moved while the app isn't running (it holds the open files).
+    drop(library);
+    let moved = dir.path().join("moved");
+    fs::rename(dir.path().join("dicts"), &moved).unwrap();
+    let mut library = Library::open(&dir.path().join("library.sqlite3")).unwrap();
+    library.check_files().unwrap();
+
+    let relocating = library.relocate(basic.id, &moved.join("./basic.mdx")).unwrap();
+    assert_eq!(relocating.status, Status::Indexing);
+    assert_eq!(relocating.path, dunce::canonicalize(moved.join("basic.mdx")).unwrap());
+    index_all(&library);
+
+    let relocated = current(&library, basic.id);
+    assert_eq!(relocated.status, Status::Ready);
+    assert_eq!(settings(&relocated), settings(&basic));
+    assert_eq!(relocated.headword_count, basic.headword_count);
+    assert_eq!(search_all(&library, "bank"), ["bank"]);
+    assert_eq!(section_ids(&library, "go"), [basic.id]);
+    assert!(resource(&library, &relocated, "basic.css").is_some(), "the .mdd beside the new file");
+    assert_eq!(library.check_files().unwrap(), [], "the new file is the one on record");
+}
+
+#[test]
+fn relocating_to_a_file_already_in_the_library_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut library, basic) = library_with_a_copy(dir.path());
+    fs::remove_file(&basic.path).unwrap();
+    library.check_files().unwrap();
+
+    let other = dunce::canonicalize(fixture("untitled/untitled.mdx")).unwrap();
+    let error = library.relocate(basic.id, &other).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("{} is already in the library as \"untitled\"", other.display())
+    );
+    assert_eq!(current(&library, basic.id).status, Status::Missing, "unchanged");
+}
+
+#[test]
+fn relocating_an_unknown_dictionary_is_an_error() {
+    let (_dir, mut library) = new_library();
+    let error = library
+        .relocate(DictionaryId::from_raw(5), &fixture("basic/basic.mdx"))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "no dictionary with id 5 in the library");
+    assert_eq!(library.dictionaries().unwrap(), []);
+}

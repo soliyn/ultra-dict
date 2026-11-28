@@ -46,8 +46,12 @@ pub fn run() {
                 Some(path) => path,
                 None => app.path().app_data_dir()?.join(LIBRARY_FILE),
             };
-            let library = Library::open(&path)
+            let mut library = Library::open(&path)
                 .map_err(|e| format!("cannot open the library at {}: {e}", path.display()))?;
+            // Files changed since the last run are queued for the indexer.
+            library
+                .check_files()
+                .map_err(|e| format!("cannot check the dictionary files: {e}"))?;
             app.manage(Mutex::new(library));
             start_indexer(app.handle()).map_err(|e| format!("cannot start indexing: {e}"))?;
             Ok(())
@@ -81,6 +85,7 @@ pub fn with_commands<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         commands::rescan_folder,
         commands::reindex_dictionary,
         commands::cancel_indexing,
+        commands::relocate_dictionary,
         commands::folders,
         commands::remove_folder,
         commands::search,
