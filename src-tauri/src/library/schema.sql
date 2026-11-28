@@ -1,4 +1,4 @@
--- Library database, schema version 4 (PRAGMA user_version).
+-- Library database, schema version 5 (PRAGMA user_version).
 --
 -- This file creates the latest schema on a new database. Upgrades of
 -- existing ones are the MIGRATIONS in mod.rs: change both together.
@@ -25,12 +25,16 @@ CREATE TABLE dictionaries (
     -- File size and modification time when indexed (NULL if unreadable).
     file_size     INTEGER,
     file_mtime_ns INTEGER,
-    -- 'ready' or 'error'.
+    -- 'indexing' (waiting for or being indexed, not searchable), 'ready',
+    -- 'needs_reindex' (indexing cancelled or interrupted) or 'error'.
     status        TEXT    NOT NULL,
     -- Human-readable reason when status is 'error'.
     error         TEXT,
     -- Whether the dictionary's own JavaScript may run in its articles.
-    allow_scripts INTEGER NOT NULL DEFAULT 0
+    allow_scripts INTEGER NOT NULL DEFAULT 0,
+    -- Bumped each time indexing is started or stopped, so an indexing run
+    -- notices it has been cancelled or superseded.
+    index_run     INTEGER NOT NULL DEFAULT 0
 );
 
 -- Folders the user added, remembered so they can be rescanned. Dictionaries
@@ -42,7 +46,8 @@ CREATE TABLE folders (
     path TEXT    NOT NULL UNIQUE
 );
 
--- Every headword of every successfully indexed dictionary.
+-- Every headword of every indexed dictionary (and of the one being indexed,
+-- not searchable until it is 'ready').
 CREATE TABLE headwords (
     id            INTEGER PRIMARY KEY,
     dictionary_id INTEGER NOT NULL REFERENCES dictionaries (id) ON DELETE CASCADE,

@@ -6,46 +6,82 @@
 //! `invoke`.
 //!
 //! The commands are `async` so that Tauri runs them off the main thread and
-//! a long `add_file` or `add_folder` does not freeze the window. Indexing
-//! still blocks other commands until it finishes; background indexing is a
-//! later step.
+//! a folder scan does not freeze the window. Indexing itself runs on the
+//! background indexer (see `start_indexer` in `lib.rs`): the commands that
+//! give it work wake it, and it reports through [`INDEXING_EVENT`].
 
 use std::path::PathBuf;
 
 use serde::Serialize;
 use tauri::State;
 
-use crate::library::{self, DictionaryId, FolderId, Library, LibraryError};
+use crate::library::{self, DictionaryId, FolderId, IndexerHandle, Library, LibraryError};
 use crate::{SharedLibrary, lock_library};
 
-/// Adds one dictionary file. A file that can't be used is still added, with
-/// `status: "error"` and a message; only library failures reject.
+/// Name of the event the background indexer emits, with an
+/// [`IndexingEvent`] payload.
+pub const INDEXING_EVENT: &str = "indexing";
+
+/// Adds one dictionary file, to be indexed in the background
+/// (`status: "indexing"`). Only library failures reject.
 #[tauri::command]
 pub async fn add_file(
     library: State<'_, SharedLibrary>,
+    indexer: State<'_, IndexerHandle>,
     path: PathBuf,
 ) -> Result<DictionaryInfo, String> {
-    with_library(&library, |lib| lib.add_file(&path)).map(DictionaryInfo::from)
+    let added = with_library(&library, |lib| lib.add_file(&path)).map(DictionaryInfo::from);
+    indexer.wake();
+    added
 }
 
-/// Adds every dictionary in a folder (recursively) and remembers the folder.
-/// Rejects if the folder can't be read.
+/// Adds every dictionary in a folder (recursively), to be indexed in the
+/// background, and remembers the folder. Rejects if the folder can't be read.
 #[tauri::command]
 pub async fn add_folder(
     library: State<'_, SharedLibrary>,
+    indexer: State<'_, IndexerHandle>,
     path: PathBuf,
 ) -> Result<FolderScan, String> {
-    with_library(&library, |lib| lib.add_folder(&path)).map(FolderScan::from)
+    let scan = with_library(&library, |lib| lib.add_folder(&path)).map(FolderScan::from);
+    indexer.wake();
+    scan
 }
 
 /// Adds the dictionaries placed in a remembered folder since it was scanned.
 #[tauri::command]
 pub async fn rescan_folder(
     library: State<'_, SharedLibrary>,
+    indexer: State<'_, IndexerHandle>,
     folder_id: i64,
 ) -> Result<FolderScan, String> {
     let id = FolderId::from_raw(folder_id);
-    with_library(&library, |lib| lib.rescan_folder(id)).map(FolderScan::from)
+    let scan = with_library(&library, |lib| lib.rescan_folder(id)).map(FolderScan::from);
+    indexer.wake();
+    scan
+}
+
+/// Indexes a dictionary again from its file, in the background.
+#[tauri::command]
+pub async fn reindex_dictionary(
+    library: State<'_, SharedLibrary>,
+    indexer: State<'_, IndexerHandle>,
+    dictionary_id: i64,
+) -> Result<DictionaryInfo, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    let info = with_library(&library, |lib| lib.reindex(id)).map(DictionaryInfo::from);
+    indexer.wake();
+    info
+}
+
+/// Stops indexing a dictionary; it is left needing reindexing.
+#[tauri::command]
+pub async fn cancel_indexing(
+    library: State<'_, SharedLibrary>,
+    dictionary_id: i64,
+) -> Result<DictionaryInfo, String> {
+    let id = DictionaryId::from_raw(dictionary_id);
+    with_library(&library, |lib| lib.cancel_indexing(id)).map(DictionaryInfo::from)
 }
 
 /// Every remembered folder.
@@ -175,7 +211,7 @@ pub struct DictionaryInfo {
     pub file_title: String,
     pub position: u32,
     pub enabled: bool,
-    /// `"ready"` or `"error"`.
+    /// `"indexing"`, `"ready"`, `"needs_reindex"` or `"error"`.
     pub status: &'static str,
     /// Why the dictionary can't be used, when `status` is `"error"`.
     pub error: Option<String>,
@@ -186,7 +222,9 @@ pub struct DictionaryInfo {
 impl From<library::DictionaryInfo> for DictionaryInfo {
     fn from(info: library::DictionaryInfo) -> Self {
         let (status, error) = match info.status {
+            library::Status::Indexing => ("indexing", None),
             library::Status::Ready => ("ready", None),
+            library::Status::NeedsReindex => ("needs_reindex", None),
             library::Status::Error(message) => ("error", Some(message)),
         };
         Self {
@@ -200,6 +238,39 @@ impl From<library::DictionaryInfo> for DictionaryInfo {
             error,
             allow_scripts: info.allow_scripts,
             headword_count: info.headword_count,
+        }
+    }
+}
+
+/// The payload of [`INDEXING_EVENT`]: how far indexing a dictionary has got,
+/// or (`finished`) that the indexer is done with it, whatever the outcome.
+/// The dictionary's new state is in the library.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexingEvent {
+    pub dictionary_id: i64,
+    pub finished: bool,
+    /// Headwords written so far (0 when finished).
+    pub done: u64,
+    /// Headwords expected (0 when finished).
+    pub total: u64,
+}
+
+impl From<library::IndexEvent> for IndexingEvent {
+    fn from(event: library::IndexEvent) -> Self {
+        match event {
+            library::IndexEvent::Progress { dictionary, progress } => Self {
+                dictionary_id: dictionary.to_raw(),
+                finished: false,
+                done: progress.done,
+                total: progress.total,
+            },
+            library::IndexEvent::Finished { dictionary } => Self {
+                dictionary_id: dictionary.to_raw(),
+                finished: true,
+                done: 0,
+                total: 0,
+            },
         }
     }
 }

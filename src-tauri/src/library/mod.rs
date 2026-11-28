@@ -6,6 +6,7 @@
 //! behind it.
 
 mod fold;
+mod indexer;
 mod resource;
 
 use std::collections::HashMap;
@@ -21,8 +22,10 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use crate::format::{self, Dictionary, EntryLocator, FormatError};
 use fold::fold;
 
+pub use indexer::{IndexEvent, Indexer, IndexerHandle, Progress};
+
 /// Schema version written to `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// `MIGRATIONS[n]` upgrades a schema-version `n + 1` database to `n + 2`.
 /// A new database gets `schema.sql`, which is already the latest version.
@@ -33,15 +36,26 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE dictionaries ADD COLUMN user_title TEXT;",
     // 3 → 4: remembered folders, for rescanning.
     "CREATE TABLE folders (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
+    // 4 → 5: background indexing tells its runs apart.
+    "ALTER TABLE dictionaries ADD COLUMN index_run INTEGER NOT NULL DEFAULT 0;",
 ];
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION - 1);
 
+/// Dictionary readers opened so far, for articles and resources, shared
+/// with the [`Indexer`]. Startup never opens them; each is opened on first
+/// use.
+type Readers = Arc<Mutex<HashMap<DictionaryId, Arc<dyn Dictionary>>>>;
+
 /// The user's dictionary collection and its index.
+///
+/// Adding a dictionary only records it, with [`Status::Indexing`]. An
+/// [`Indexer`] (see [`Library::indexer`]) reads its headwords on its own
+/// database connection, so the library stays usable meanwhile.
 pub struct Library {
     db: Connection,
-    /// Dictionary readers opened so far, for articles and resources.
-    /// Startup never opens them; each is opened on first use.
-    readers: Mutex<HashMap<DictionaryId, Arc<dyn Dictionary>>>,
+    /// The database file, for the indexer's own connection.
+    path: PathBuf,
+    readers: Readers,
 }
 
 impl Library {
@@ -51,18 +65,39 @@ impl Library {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
-        let db = Connection::open(path)?;
-        db.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
-        )?;
         let mut library = Self {
-            db,
-            readers: Mutex::default(),
+            db: connect(path)?,
+            path: path.to_owned(),
+            readers: Readers::default(),
         };
         library.migrate()?;
+        library.recover_interrupted()?;
         Ok(library)
+    }
+
+    /// Indexing that was under way when the app last stopped never finished:
+    /// those dictionaries need reindexing, and lose what was written.
+    fn recover_interrupted(&mut self) -> Result<(), LibraryError> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "DELETE FROM headwords WHERE dictionary_id IN
+                 (SELECT id FROM dictionaries WHERE status = 'indexing')",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE dictionaries SET status = 'needs_reindex', index_run = index_run + 1
+             WHERE status = 'indexing'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// An indexer for this library. It indexes the dictionaries waiting with
+    /// [`Status::Indexing`], on its own connection to the database. Use one
+    /// indexer per library, created after opening it.
+    pub fn indexer(&self) -> Result<Indexer, LibraryError> {
+        Ok(Indexer::new(connect(&self.path)?, Arc::clone(&self.readers)))
     }
 
     fn migrate(&mut self) -> Result<(), LibraryError> {
@@ -86,23 +121,24 @@ impl Library {
         Ok(())
     }
 
-    /// Adds the dictionary file at `path` and indexes it.
+    /// Adds the dictionary file at `path`, waiting to be indexed: it has
+    /// [`Status::Indexing`], and the file name as its title until then.
     ///
     /// The file is referenced in place. Adding a file that is already in the
     /// library changes nothing and returns the existing record, however the
     /// path is spelled (`.`, `..`, links, letter case on Windows).
     ///
-    /// A file that cannot be opened or indexed is still recorded, with
-    /// [`Status::Error`], so the user sees why; that is not an `Err`. Indexing
-    /// is atomic: a dictionary has either all of its headwords or none.
-    /// `Err` means the library itself (the database) failed.
+    /// A file the indexer can't use stays in the library with
+    /// [`Status::Error`], so the user sees why. `Err` means the library
+    /// itself (the database) failed.
     pub fn add_file(&mut self, path: &Path) -> Result<DictionaryInfo, LibraryError> {
         let path = normalize(path)?;
         Ok(self.add_normalized(&path)?.0)
     }
 
     /// Adds every dictionary file in the folder at `path` and its subfolders,
-    /// as [`add_file`](Self::add_file) would, in path order, and remembers
+    /// as [`add_file`](Self::add_file) would (waiting to be indexed), in path
+    /// order, and remembers
     /// the folder for [`rescan_folder`](Self::rescan_folder).
     ///
     /// Files already in the library are skipped, so adding a folder again (or
@@ -185,23 +221,44 @@ impl Library {
             return Ok((existing, false));
         }
 
-        let stamp = FileStamp::read(path);
-        let (title, failure) = match format::open(path) {
-            Ok(dict) => {
-                let title = dict.metadata().title.clone();
-                match self.insert_indexed(path_text, &title, stamp, dict.as_ref())? {
-                    Ok(id) => {
-                        // Already open: keep it for the articles to come.
-                        self.lock_readers().insert(id, Arc::from(dict));
-                        return Ok((self.get(id)?, true));
-                    }
-                    Err(error) => (title, error),
-                }
-            }
-            Err(error) => (format::display_title(None, path), error),
-        };
-        let id = self.insert_failed(path_text, &title, stamp, &failure.to_string())?;
+        self.db.execute(
+            "INSERT INTO dictionaries (path, title, position, enabled, status)
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(position) + 1, 0) FROM dictionaries), 1,
+                     'indexing')",
+            params![path_text, format::display_title(None, path)],
+        )?;
+        let id = DictionaryId(self.db.last_insert_rowid());
         Ok((self.get(id)?, true))
+    }
+
+    /// Indexes dictionary `id` again from its file, whatever its status. It
+    /// has [`Status::Indexing`] (not searchable) until an [`Indexer`] is
+    /// done; its settings (name, order, enabled, scripts) are kept. A run
+    /// already under way starts over.
+    pub fn reindex(&mut self, id: DictionaryId) -> Result<DictionaryInfo, LibraryError> {
+        self.db.execute(
+            "UPDATE dictionaries SET status = 'indexing', error = NULL, index_run = index_run + 1
+             WHERE id = ?1",
+            [id.0],
+        )?;
+        self.get(id)
+    }
+
+    /// Stops indexing dictionary `id`, whether it is waiting or under way.
+    /// It is left with [`Status::NeedsReindex`] and no headwords. A
+    /// dictionary that isn't being indexed is left as it is.
+    pub fn cancel_indexing(&mut self, id: DictionaryId) -> Result<DictionaryInfo, LibraryError> {
+        let tx = self.db.transaction()?;
+        let cancelled = tx.execute(
+            "UPDATE dictionaries SET status = 'needs_reindex', index_run = index_run + 1
+             WHERE id = ?1 AND status = 'indexing'",
+            [id.0],
+        )?;
+        if cancelled > 0 {
+            tx.execute("DELETE FROM headwords WHERE dictionary_id = ?1", [id.0])?;
+        }
+        tx.commit()?;
+        self.get(id)
     }
 
     /// Every dictionary in library order.
@@ -471,14 +528,15 @@ impl Library {
         Ok(Arc::clone(self.lock_readers().entry(id).or_insert(dict)))
     }
 
-    fn lock_readers(&self) -> std::sync::MutexGuard<'_, HashMap<DictionaryId, Arc<dyn Dictionary>>> {
-        // The map stays consistent even if a holder panicked.
-        self.readers.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock_readers(&self) -> ReadersGuard<'_> {
+        lock_readers(&self.readers)
     }
 
     fn get(&self, id: DictionaryId) -> Result<DictionaryInfo, LibraryError> {
         let mut stmt = self.db.prepare_cached(&format!("{SELECT_INFO} WHERE d.id = ?1"))?;
-        Ok(stmt.query_row([id.0], DictionaryInfo::from_row)?)
+        stmt.query_row([id.0], DictionaryInfo::from_row)
+            .optional()?
+            .ok_or(LibraryError::UnknownDictionary(id))
     }
 
     fn find_by_path(&self, path: &str) -> Result<Option<DictionaryInfo>, LibraryError> {
@@ -488,55 +546,27 @@ impl Library {
         Ok(stmt.query_row([path], DictionaryInfo::from_row).optional()?)
     }
 
-    /// Records the dictionary and all its headwords in one transaction.
-    ///
-    /// The outer `Err` is a database failure; the inner one a format error
-    /// while reading headwords, after which nothing has been written.
-    fn insert_indexed(
-        &mut self,
-        path: &str,
-        title: &str,
-        stamp: Option<FileStamp>,
-        dict: &dyn Dictionary,
-    ) -> Result<Result<DictionaryId, FormatError>, LibraryError> {
-        let tx = self.db.transaction()?;
-        let id = insert_dictionary(&tx, path, title, stamp, "ready", None)?;
-        {
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO headwords (dictionary_id, headword, folded, locator)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for headword in dict.headwords() {
-                let headword = match headword {
-                    Ok(headword) => headword,
-                    // Dropping `tx` rolls everything back.
-                    Err(error) => return Ok(Err(error)),
-                };
-                insert.execute(params![
-                    id.0,
-                    headword.text,
-                    fold(&headword.text),
-                    // Bit-preserving: locators round-trip through i64.
-                    headword.locator.to_raw() as i64,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(Ok(id))
-    }
+}
 
-    fn insert_failed(
-        &mut self,
-        path: &str,
-        title: &str,
-        stamp: Option<FileStamp>,
-        message: &str,
-    ) -> Result<DictionaryId, LibraryError> {
-        let tx = self.db.transaction()?;
-        let id = insert_dictionary(&tx, path, title, stamp, "error", Some(message))?;
-        tx.commit()?;
-        Ok(id)
-    }
+type ReadersGuard<'a> = std::sync::MutexGuard<'a, HashMap<DictionaryId, Arc<dyn Dictionary>>>;
+
+fn lock_readers(readers: &Readers) -> ReadersGuard<'_> {
+    // The map stays consistent even if a holder panicked.
+    readers.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Opens a connection to the library database at `path`.
+fn connect(path: &Path) -> Result<Connection, LibraryError> {
+    let db = Connection::open(path)?;
+    db.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;",
+    )?;
+    // The library and its indexer write through separate connections; each
+    // waits out the other's short transactions.
+    db.busy_timeout(Duration::from_secs(30))?;
+    Ok(db)
 }
 
 /// The one spelling of `path` the library stores: canonical (`.` and `..`
@@ -589,32 +619,6 @@ fn find_dictionary_files(folder: &Path) -> Result<Vec<PathBuf>, LibraryError> {
 
 fn is_dictionary_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mdx"))
-}
-
-/// Inserts a dictionary row at the end of the library order.
-fn insert_dictionary(
-    tx: &Transaction<'_>,
-    path: &str,
-    title: &str,
-    stamp: Option<FileStamp>,
-    status: &str,
-    error: Option<&str>,
-) -> Result<DictionaryId, LibraryError> {
-    tx.execute(
-        "INSERT INTO dictionaries
-             (path, title, position, enabled, file_size, file_mtime_ns, status, error)
-         VALUES
-             (?1, ?2, (SELECT COALESCE(MAX(position) + 1, 0) FROM dictionaries), 1, ?3, ?4, ?5, ?6)",
-        params![
-            path,
-            title,
-            stamp.map(|s| s.size as i64),
-            stamp.map(|s| s.modified_ns()),
-            status,
-            error,
-        ],
-    )?;
-    Ok(DictionaryId(tx.last_insert_rowid()))
 }
 
 /// Every dictionary id, in library order.
@@ -686,7 +690,9 @@ pub struct SearchPage {
 const SELECT_INFO: &str = "
     SELECT d.id, d.path, COALESCE(d.user_title, d.title), d.title, d.position, d.enabled,
            d.file_size, d.file_mtime_ns, d.status, d.error, d.allow_scripts,
-           (SELECT COUNT(*) FROM headwords h WHERE h.dictionary_id = d.id)
+           CASE WHEN d.status = 'ready'
+                THEN (SELECT COUNT(*) FROM headwords h WHERE h.dictionary_id = d.id)
+                ELSE 0 END
     FROM dictionaries d";
 
 /// Identifies a dictionary within one library.
@@ -770,8 +776,8 @@ pub struct DictionaryInfo {
     /// Place in the library order (0 is first).
     pub position: u32,
     pub enabled: bool,
-    /// Size and modification time of the file when it was indexed, or
-    /// `None` if the file could not be read.
+    /// Size and modification time of the file when it was last indexed, or
+    /// `None` if it hasn't been yet or the file could not be read.
     pub file: Option<FileStamp>,
     pub status: Status,
     /// Whether the dictionary's own JavaScript may run in its articles
@@ -800,6 +806,8 @@ impl DictionaryInfo {
             }),
             status: match status.as_str() {
                 "ready" => Status::Ready,
+                "indexing" => Status::Indexing,
+                "needs_reindex" => Status::NeedsReindex,
                 _ => Status::Error(error.unwrap_or(status)),
             },
             allow_scripts: row.get(10)?,
@@ -811,8 +819,14 @@ impl DictionaryInfo {
 /// Where a dictionary stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
+    /// Waiting to be indexed or being indexed, and not searchable yet. The
+    /// [`Indexer`] reports progress.
+    Indexing,
     /// Indexed and searchable.
     Ready,
+    /// Indexing was cancelled or interrupted, and nothing of it was kept.
+    /// See [`Library::reindex`].
+    NeedsReindex,
     /// Could not be opened or indexed; the message says why
     /// (e.g. `"unsupported: needs registration key"`).
     Error(String),

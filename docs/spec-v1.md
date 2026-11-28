@@ -43,9 +43,9 @@ One SQLite database (`rusqlite`, bundled) in the Tauri app data directory holds:
 Indexing:
 
 - Each dictionary is indexed once, when added (or when it changes). Startup only reads SQLite; the format reader is opened lazily to fetch articles and resources.
-- Runs on a background thread, emitting progress events to the UI, and is cancellable.
+- Runs on a background thread, emitting progress events to the UI, and is cancellable. Headwords are written in short batches; the dictionary turns `ready` in the last one.
 - A dictionary is searchable only once indexing completes. Interrupted or cancelled indexing leaves it `needs reindex`, never half-indexed.
-- The largest reference dictionary (500 MB `.mdx`) is the performance benchmark for indexing time.
+- The largest reference dictionary (500 MB `.mdx`) is the performance benchmark for indexing time: about 0.7 s for its ~250k headwords in a release build (#16).
 
 ## Search
 
