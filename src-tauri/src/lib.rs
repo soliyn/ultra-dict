@@ -61,6 +61,10 @@ pub fn run() {
 pub fn with_commands<R: Runtime>(builder: Builder<R>) -> Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         commands::add_file,
+        commands::add_folder,
+        commands::rescan_folder,
+        commands::folders,
+        commands::remove_folder,
         commands::search,
         commands::article,
         commands::set_allow_scripts,

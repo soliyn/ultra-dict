@@ -8,7 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
-use ultra_dict_lib::library::{Article, DictionaryId, DictionaryInfo, Library, Resource, Status};
+use ultra_dict_lib::library::{
+    Article, DictionaryId, DictionaryInfo, FolderId, Library, Resource, Status,
+};
 
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
@@ -648,6 +650,8 @@ fn an_old_library_is_upgraded_in_place() {
     assert_eq!(old.file_title, "Old");
     assert!(library.set_allow_scripts(old.id, true).unwrap().allow_scripts);
     assert_eq!(library.rename(old.id, "New").unwrap().title, "New");
+    let scan = library.add_folder(&fixture("untitled")).unwrap();
+    assert_eq!(scan.added.len(), 1, "folders work after the upgrade");
     drop(library);
     let reopened = Library::open(&db).unwrap().dictionaries().unwrap().remove(0);
     assert!(reopened.allow_scripts, "reopens");
@@ -907,4 +911,291 @@ fn enabled_flag_persists_across_reopening() {
     let library = Library::open(&db).unwrap();
     assert!(!library.dictionaries().unwrap()[0].enabled);
     assert_eq!(search_all(&library, "go"), [] as [&str; 0]);
+}
+
+// --- folders --------------------------------------------------------------
+
+/// Copies fixture folder `rel` (every file in it) into `dir/sub`.
+fn copy_fixture_folder(dir: &Path, sub: &str, rel: &str) {
+    let folder = dir.join(sub);
+    fs::create_dir_all(&folder).unwrap();
+    for entry in fs::read_dir(fixture(rel)).unwrap() {
+        let path = entry.unwrap().path();
+        fs::copy(&path, folder.join(path.file_name().unwrap())).unwrap();
+    }
+}
+
+/// A folder tree of dictionaries under `dir/dicts`:
+///
+/// ```text
+/// dicts/basic/basic.mdx, basic.mdd, notes.txt
+/// dicts/more/deeper/untitled.mdx
+/// dicts/more/deeper/multi.mdx, multi.mdd, multi.1.mdd
+/// ```
+fn dictionary_tree(dir: &Path) -> PathBuf {
+    copy_fixture_folder(dir, "dicts/basic", "basic");
+    fs::write(dir.join("dicts/basic/notes.txt"), "not a dictionary").unwrap();
+    copy_fixture_folder(dir, "dicts/more/deeper", "untitled");
+    copy_fixture_folder(dir, "dicts/more/deeper", "multivolume");
+    dir.join("dicts")
+}
+
+fn titles(infos: &[DictionaryInfo]) -> Vec<&str> {
+    infos.iter().map(|d| d.title.as_str()).collect()
+}
+
+fn file_name(info: &DictionaryInfo) -> &str {
+    info.path.file_name().unwrap().to_str().unwrap()
+}
+
+#[test]
+fn adding_a_folder_adds_every_mdx_in_it_recursively() {
+    let (dir, mut library) = new_library();
+    let folder = dictionary_tree(dir.path());
+
+    let scan = library.add_folder(&folder).unwrap();
+    assert_eq!(
+        titles(&scan.added),
+        ["Basic Test Dictionary", "Multi-volume Test Dictionary", "untitled"],
+        "in path order; .mdd and other files are not dictionaries"
+    );
+    assert!(scan.added.iter().all(|d| d.status == Status::Ready), "{:?}", scan.added);
+    assert_eq!(library.dictionaries().unwrap(), scan.added);
+    assert_eq!(search_all(&library, "n"), ["nameless"]);
+
+    // Their resource volumes were found as for a single file.
+    let multi = &scan.added[1];
+    assert!(resource(&library, multi, "img/v1.png").is_some(), "from multi.1.mdd");
+}
+
+#[test]
+fn adding_a_folder_remembers_it() {
+    let (dir, mut library) = new_library();
+    let folder = dictionary_tree(dir.path());
+    let scan = library.add_folder(&folder).unwrap();
+    assert_eq!(library.folders().unwrap(), std::slice::from_ref(&scan.folder));
+    assert_eq!(
+        fs::canonicalize(&scan.folder.path).unwrap(),
+        fs::canonicalize(&folder).unwrap()
+    );
+
+    let db = dir.path().join("library.sqlite3");
+    drop(library);
+    assert_eq!(Library::open(&db).unwrap().folders().unwrap(), [scan.folder]);
+}
+
+#[test]
+fn mdx_extension_matches_in_any_case() {
+    let (dir, mut library) = new_library();
+    fs::create_dir_all(dir.path().join("dicts")).unwrap();
+    fs::copy(fixture("untitled/untitled.mdx"), dir.path().join("dicts/LOUD.MDX")).unwrap();
+    let scan = library.add_folder(&dir.path().join("dicts")).unwrap();
+    assert_eq!(titles(&scan.added), ["LOUD"]);
+}
+
+#[test]
+fn unusable_dictionaries_in_a_folder_are_added_with_their_error() {
+    let (dir, mut library) = new_library();
+    copy_fixture_folder(dir.path(), "dicts", "encrypted");
+    copy_fixture_folder(dir.path(), "dicts", "untitled");
+    let scan = library.add_folder(&dir.path().join("dicts")).unwrap();
+    let statuses: Vec<_> = scan.added.iter().map(|d| (file_name(d), d.status.clone())).collect();
+    assert_eq!(
+        statuses,
+        [
+            ("encrypted.mdx", Status::Error("unsupported: needs registration key".into())),
+            ("untitled.mdx", Status::Ready),
+        ]
+    );
+}
+
+#[test]
+fn an_empty_folder_adds_nothing_but_is_remembered() {
+    let (dir, mut library) = new_library();
+    fs::create_dir_all(dir.path().join("empty")).unwrap();
+    let scan = library.add_folder(&dir.path().join("empty")).unwrap();
+    assert_eq!(scan.added, []);
+    assert_eq!(library.folders().unwrap(), [scan.folder]);
+}
+
+#[test]
+fn adding_a_missing_folder_is_an_error_and_records_nothing() {
+    let (dir, mut library) = new_library();
+    let error = library.add_folder(&dir.path().join("no-such-folder")).unwrap_err();
+    assert!(error.to_string().starts_with("cannot read folder"), "{error}");
+    assert_eq!(library.folders().unwrap(), []);
+}
+
+#[test]
+fn adding_a_file_as_a_folder_is_an_error() {
+    let (_dir, mut library) = new_library();
+    let error = library.add_folder(&fixture("basic/basic.mdx")).unwrap_err();
+    assert!(error.to_string().starts_with("cannot read folder"), "{error}");
+    assert_eq!(library.folders().unwrap(), []);
+    assert_eq!(library.dictionaries().unwrap(), []);
+}
+
+#[test]
+fn rescanning_adds_only_dictionaries_placed_there_since() {
+    let (dir, mut library) = new_library();
+    copy_fixture_folder(dir.path(), "dicts/a", "basic");
+    let first = library.add_folder(&dir.path().join("dicts")).unwrap();
+    let basic = first.added[0].clone();
+    let renamed = library.rename(basic.id, "Mine").unwrap();
+
+    copy_fixture_folder(dir.path(), "dicts/b", "untitled");
+    let rescan = library.rescan_folder(first.folder.id).unwrap();
+    assert_eq!(rescan.folder, first.folder);
+    assert_eq!(titles(&rescan.added), ["untitled"]);
+    assert_eq!(rescan.added[0].position, 1);
+
+    let listed = library.dictionaries().unwrap();
+    assert_eq!(listed, [renamed, rescan.added[0].clone()], "the first kept as it was");
+    assert_eq!(library.search("", 0, 0).unwrap().total_count, 19, "headwords not doubled");
+}
+
+#[test]
+fn rescanning_an_unchanged_folder_adds_nothing() {
+    let (dir, mut library) = new_library();
+    let folder = dictionary_tree(dir.path());
+    let first = library.add_folder(&folder).unwrap();
+    let before = library.dictionaries().unwrap();
+    assert_eq!(library.rescan_folder(first.folder.id).unwrap().added, []);
+    assert_eq!(library.dictionaries().unwrap(), before);
+}
+
+#[test]
+fn rescan_works_after_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("library.sqlite3");
+    copy_fixture_folder(dir.path(), "dicts", "basic");
+    let folder = Library::open(&db).unwrap().add_folder(&dir.path().join("dicts")).unwrap().folder;
+    copy_fixture_folder(dir.path(), "dicts", "untitled");
+    let scan = Library::open(&db).unwrap().rescan_folder(folder.id).unwrap();
+    assert_eq!(titles(&scan.added), ["untitled"]);
+}
+
+#[test]
+fn rescanning_a_folder_that_is_gone_is_an_error_and_keeps_it() {
+    let (dir, mut library) = new_library();
+    copy_fixture_folder(dir.path(), "dicts", "untitled");
+    let folder = library.add_folder(&dir.path().join("dicts")).unwrap().folder;
+    fs::remove_dir_all(dir.path().join("dicts")).unwrap();
+
+    let error = library.rescan_folder(folder.id).unwrap_err();
+    assert!(error.to_string().starts_with("cannot read folder"), "{error}");
+    assert_eq!(library.folders().unwrap(), [folder]);
+    assert_eq!(library.dictionaries().unwrap().len(), 1);
+}
+
+#[test]
+fn rescanning_an_unknown_folder_is_an_error() {
+    let (_dir, mut library) = new_library();
+    let error = library.rescan_folder(FolderId::from_raw(3)).unwrap_err();
+    assert_eq!(error.to_string(), "no folder with id 3 in the library");
+}
+
+#[test]
+fn adding_the_same_folder_again_is_a_no_op() {
+    let (dir, mut library) = new_library();
+    let folder = dictionary_tree(dir.path());
+    let first = library.add_folder(&folder).unwrap();
+    let before = library.dictionaries().unwrap();
+
+    for again in [folder.clone(), folder.join("basic/.."), folder.join(".")] {
+        let scan = library.add_folder(&again).unwrap();
+        assert_eq!(scan.folder, first.folder, "{again:?}");
+        assert_eq!(scan.added, [], "{again:?}");
+    }
+    assert_eq!(library.folders().unwrap(), [first.folder]);
+    assert_eq!(library.dictionaries().unwrap(), before);
+}
+
+#[test]
+fn a_folder_skips_dictionaries_already_added_as_files() {
+    let (dir, mut library) = new_library();
+    let folder = dictionary_tree(dir.path());
+    let basic = library.add_file(&folder.join("basic/basic.mdx")).unwrap();
+
+    let scan = library.add_folder(&folder).unwrap();
+    assert_eq!(titles(&scan.added), ["Multi-volume Test Dictionary", "untitled"]);
+    let listed = library.dictionaries().unwrap();
+    assert_eq!((listed.len(), &listed[0]), (3, &basic));
+}
+
+#[test]
+fn a_file_already_found_in_a_folder_is_not_added_again() {
+    let (dir, mut library) = new_library();
+    let folder = dictionary_tree(dir.path());
+    let scan = library.add_folder(&folder).unwrap();
+    let again = library.add_file(&folder.join("more/deeper/untitled.mdx")).unwrap();
+    assert_eq!(again, scan.added[2]);
+    assert_eq!(library.dictionaries().unwrap(), scan.added);
+}
+
+#[test]
+fn a_nested_folder_adds_nothing_its_parent_already_added() {
+    let (dir, mut library) = new_library();
+    let folder = dictionary_tree(dir.path());
+    library.add_folder(&folder).unwrap();
+    let nested = library.add_folder(&folder.join("more")).unwrap();
+    assert_eq!(nested.added, []);
+    assert_eq!(library.folders().unwrap().len(), 2, "both remembered");
+}
+
+#[test]
+fn the_same_file_spelled_differently_is_not_added_twice() {
+    let (dir, mut library) = new_library();
+    copy_fixture_folder(dir.path(), "dicts/basic", "basic");
+    let first = library.add_file(&dir.path().join("dicts/basic/basic.mdx")).unwrap();
+    for spelling in [
+        dir.path().join("dicts/basic/./basic.mdx"),
+        dir.path().join("dicts/basic/../basic/basic.mdx"),
+    ] {
+        assert_eq!(library.add_file(&spelling).unwrap(), first, "{spelling:?}");
+    }
+    assert_eq!(library.dictionaries().unwrap(), [first]);
+}
+
+#[cfg(windows)]
+#[test]
+fn paths_differing_only_in_case_are_the_same_on_windows() {
+    let (dir, mut library) = new_library();
+    copy_fixture_folder(dir.path(), "dicts/basic", "basic");
+    let first = library.add_file(&dir.path().join("dicts/basic/basic.mdx")).unwrap();
+    assert_eq!(library.add_file(&dir.path().join("DICTS/BASIC/BASIC.MDX")).unwrap(), first);
+
+    let scan = library.add_folder(&dir.path().join("Dicts")).unwrap();
+    assert_eq!(scan.added, []);
+    assert_eq!(library.add_folder(&dir.path().join("dicts")).unwrap().folder, scan.folder);
+    assert_eq!(library.folders().unwrap().len(), 1);
+    assert_eq!(library.dictionaries().unwrap(), [first]);
+}
+
+#[test]
+fn removing_a_folder_forgets_it_and_keeps_its_dictionaries() {
+    let (dir, mut library) = new_library();
+    copy_fixture_folder(dir.path(), "a", "basic");
+    copy_fixture_folder(dir.path(), "b", "untitled");
+    let a = library.add_folder(&dir.path().join("a")).unwrap();
+    let b = library.add_folder(&dir.path().join("b")).unwrap();
+    let before = library.dictionaries().unwrap();
+
+    assert_eq!(library.remove_folder(a.folder.id).unwrap(), std::slice::from_ref(&b.folder));
+    assert_eq!(library.folders().unwrap(), [b.folder]);
+    assert_eq!(library.dictionaries().unwrap(), before);
+    assert!(dir.path().join("a/basic.mdx").is_file());
+
+    let error = library.remove_folder(a.folder.id).unwrap_err();
+    assert_eq!(error.to_string(), format!("no folder with id {} in the library", a.folder.id));
+}
+
+#[test]
+fn a_removed_dictionary_comes_back_when_its_folder_is_rescanned() {
+    let (dir, mut library) = new_library();
+    copy_fixture_folder(dir.path(), "dicts", "untitled");
+    let scan = library.add_folder(&dir.path().join("dicts")).unwrap();
+    library.remove(scan.added[0].id).unwrap();
+    let rescan = library.rescan_folder(scan.folder.id).unwrap();
+    assert_eq!(titles(&rescan.added), ["untitled"]);
 }

@@ -209,6 +209,12 @@ body,
   overflow-wrap: anywhere;
 }
 
+.notice.info {
+  color: var(--fg);
+  background: var(--bg-sidebar);
+  border-color: var(--border);
+}
+
 .notice span {
   flex: 1;
 }
@@ -353,6 +359,26 @@ body,
 .library-rename {
   display: flex;
   gap: 6px;
+}
+
+.library-folders {
+  margin-bottom: 16px;
+}
+
+.library-subtitle {
+  margin: 0 0 4px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+
+.library-folder-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .library-actions {

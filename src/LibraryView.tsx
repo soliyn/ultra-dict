@@ -1,5 +1,6 @@
-// The dictionary list: add, enable/disable, reorder, rename and remove.
-// Shown in the article area instead of an article.
+// The dictionary list: add files and folders, rescan folders, and enable/
+// disable, reorder, rename and remove dictionaries. Shown in the article
+// area instead of an article.
 
 import { FormEvent, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -16,18 +17,25 @@ interface Props {
 
 export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
   const [dictionaries, setDictionaries] = useState<api.DictionaryInfo[] | null>(null);
-  // A failed add or change, shown until dismissed or the next action.
-  const [notice, setNotice] = useState<string | null>(null);
-  const [adding, setAdding] = useState(false);
+  const [folders, setFolders] = useState<api.FolderInfo[]>([]);
+  // The outcome of the last add or change (a failure, or what a folder scan
+  // found), shown until dismissed or the next action.
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const failed = (message: string) => setNotice({ message, error: true });
+  // The add or scan under way: "file", "folder", or the rescanned folder's id.
+  const [adding, setAdding] = useState<"file" | "folder" | number | null>(null);
   // Changes run one at a time, so rapid clicks can't interleave.
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     let current = true;
-    api
-      .dictionaries()
-      .then((list) => current && setDictionaries(list))
-      .catch((e) => current && setNotice(strings.loadDictionariesFailed(String(e))));
+    Promise.all([api.dictionaries(), api.folders()])
+      .then(([list, folderList]) => {
+        if (!current) return;
+        setDictionaries(list);
+        setFolders(folderList);
+      })
+      .catch((e) => current && failed(strings.loadDictionariesFailed(String(e))));
     return () => {
       current = false;
     };
@@ -45,53 +53,124 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
       onChanged();
       return true;
     } catch (e) {
-      setNotice(strings.libraryChangeFailed(String(e)));
+      failed(strings.libraryChangeFailed(String(e)));
       return false;
     } finally {
       setBusy(false);
     }
   };
 
-  const addFile = async () => {
-    setAdding(true);
+  /**
+   * Runs one add or scan. `run` resolves to the notice to show (null for
+   * none), or to `undefined` if the user cancelled the picker.
+   */
+  const add = async (what: "file" | "folder" | number, run: () => Promise<Notice | null | undefined>) => {
+    setAdding(what);
+    let changed = false;
     try {
+      const outcome = await run();
+      if (outcome === undefined) return;
+      changed = true;
+      setNotice(outcome);
+    } catch (e) {
+      // A scan may have added some dictionaries before it failed.
+      changed = true;
+      failed(strings.addFailed(String(e)));
+    } finally {
+      setAdding(null);
+      if (changed) onChanged();
+    }
+  };
+
+  const addFile = () =>
+    add("file", async () => {
       const path = await open({
         multiple: false,
         directory: false,
         filters: [{ name: strings.dictionaryFilter, extensions: ["mdx"] }],
       });
-      if (path === null) return;
-      setNotice(null);
+      if (path === null) return undefined;
       const info = await api.addFile(path);
-      if (info.status === "error") setNotice(strings.dictionaryUnusable(info.title, info.error ?? ""));
-      onChanged();
+      return info.status === "error"
+        ? { message: strings.dictionaryUnusable(info.title, info.error ?? ""), error: true }
+        : null;
+    });
+
+  const addFolder = () =>
+    add("folder", async () => {
+      const path = await open({ multiple: false, directory: true });
+      if (path === null) return undefined;
+      return scanNotice(await api.addFolder(path));
+    });
+
+  const rescan = (folder: api.FolderInfo) =>
+    add(folder.id, async () => scanNotice(await api.rescanFolder(folder.id)));
+
+  // Forgetting a folder changes no dictionary, so nothing else refetches.
+  const forget = async (folder: api.FolderInfo) => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      setFolders(await api.removeFolder(folder.id));
     } catch (e) {
-      setNotice(strings.addFailed(String(e)));
+      failed(strings.libraryChangeFailed(String(e)));
     } finally {
-      setAdding(false);
+      setBusy(false);
     }
   };
 
   const count = dictionaries?.length ?? 0;
+  const locked = adding !== null || busy;
   return (
     <section className="library">
       <header className="library-header">
         <h1 className="library-title">{strings.dictionaries}</h1>
-        <button className="button" onClick={addFile} disabled={adding || busy}>
-          {adding ? strings.adding : strings.addFile}
+        <button className="button" onClick={addFile} disabled={locked}>
+          {adding === "file" ? strings.adding : strings.addFile}
+        </button>
+        <button className="button" onClick={addFolder} disabled={locked}>
+          {adding === "folder" ? strings.scanning : strings.addFolder}
         </button>
         <button className="button" onClick={onClose}>
           {strings.closeDictionaries}
         </button>
       </header>
       {notice !== null && (
-        <div className="notice" role="alert">
-          <span>{notice}</span>
+        <div className={"notice" + (notice.error ? "" : " info")} role={notice.error ? "alert" : "status"}>
+          <span>{notice.message}</span>
           <button className="notice-dismiss" onClick={() => setNotice(null)} aria-label={strings.dismiss}>
             ×
           </button>
         </div>
       )}
+      {folders.length > 0 && (
+        <section className="library-folders">
+          <h2 className="library-subtitle">{strings.folders}</h2>
+          <ul className="library-list">
+            {folders.map((folder) => (
+              <li key={folder.id} className="library-row">
+                <span className="library-folder-path" title={folder.path}>
+                  {folder.path}
+                </span>
+                <div className="library-actions">
+                  <button className="button" onClick={() => rescan(folder)} disabled={locked} title={strings.rescanHint}>
+                    {adding === folder.id ? strings.scanning : strings.rescan}
+                  </button>
+                  <button
+                    className="button"
+                    onClick={() => forget(folder)}
+                    disabled={locked}
+                    title={strings.forgetFolderHint}
+                  >
+                    {strings.forgetFolder}
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {folders.length > 0 && <h2 className="library-subtitle">{strings.dictionaries}</h2>}
       {dictionaries !== null && count === 0 && <p className="placeholder">{strings.emptyLibrary}</p>}
       <ol className="library-list">
         {dictionaries?.map((d, index) => (
@@ -100,7 +179,7 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
             dictionary={d}
             index={index}
             last={index === count - 1}
-            busy={busy || adding}
+            busy={locked}
             onEnabled={(enabled) => change(() => api.setEnabled(d.id, enabled))}
             onMove={(position) => change(() => api.moveDictionary(d.id, position))}
             onRename={(name) => change(() => api.renameDictionary(d.id, name))}
@@ -110,6 +189,19 @@ export function LibraryView({ libraryVersion, onChanged, onClose }: Props) {
       </ol>
     </section>
   );
+}
+
+interface Notice {
+  message: string;
+  /** Shown as an alert; otherwise as plain information. */
+  error: boolean;
+}
+
+/** What a folder add or rescan found, as a notice. */
+function scanNotice({ folder, added }: api.FolderScan): Notice {
+  if (added.length === 0) return { message: strings.scanFoundNothing(folder.path), error: false };
+  const unusable = added.filter((d) => d.status === "error").length;
+  return { message: strings.scanAdded(added.length, unusable), error: unusable > 0 };
 }
 
 interface RowProps {

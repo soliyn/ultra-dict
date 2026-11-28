@@ -22,7 +22,7 @@ use crate::format::{self, Dictionary, EntryLocator, FormatError};
 use fold::fold;
 
 /// Schema version written to `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// `MIGRATIONS[n]` upgrades a schema-version `n + 1` database to `n + 2`.
 /// A new database gets `schema.sql`, which is already the latest version.
@@ -31,6 +31,8 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE dictionaries ADD COLUMN allow_scripts INTEGER NOT NULL DEFAULT 0;",
     // 2 → 3: the user's own name for a dictionary.
     "ALTER TABLE dictionaries ADD COLUMN user_title TEXT;",
+    // 3 → 4: remembered folders, for rescanning.
+    "CREATE TABLE folders (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
 ];
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION - 1);
 
@@ -86,39 +88,120 @@ impl Library {
 
     /// Adds the dictionary file at `path` and indexes it.
     ///
-    /// The file is referenced in place. Adding a path that is already in the
-    /// library changes nothing and returns the existing record.
+    /// The file is referenced in place. Adding a file that is already in the
+    /// library changes nothing and returns the existing record, however the
+    /// path is spelled (`.`, `..`, links, letter case on Windows).
     ///
     /// A file that cannot be opened or indexed is still recorded, with
     /// [`Status::Error`], so the user sees why; that is not an `Err`. Indexing
     /// is atomic: a dictionary has either all of its headwords or none.
     /// `Err` means the library itself (the database) failed.
     pub fn add_file(&mut self, path: &Path) -> Result<DictionaryInfo, LibraryError> {
-        let path = std::path::absolute(path)?;
-        let path_text = path
-            .to_str()
-            .ok_or_else(|| LibraryError::PathNotUnicode(path.clone()))?;
+        let path = normalize(path)?;
+        Ok(self.add_normalized(&path)?.0)
+    }
+
+    /// Adds every dictionary file in the folder at `path` and its subfolders,
+    /// as [`add_file`](Self::add_file) would, in path order, and remembers
+    /// the folder for [`rescan_folder`](Self::rescan_folder).
+    ///
+    /// Files already in the library are skipped, so adding a folder again (or
+    /// one inside an added folder) only picks up what is new. Linked
+    /// subfolders are not followed. A folder that can't be read is an `Err`,
+    /// and nothing is recorded; unreadable subfolders are skipped.
+    pub fn add_folder(&mut self, path: &Path) -> Result<FolderScan, LibraryError> {
+        let path = dunce::canonicalize(path).map_err(|e| folder_error(path, e))?;
+        let files = find_dictionary_files(&path)?;
+        let path_text = path_text(&path)?;
+        self.db.execute(
+            "INSERT INTO folders (path) VALUES (?1) ON CONFLICT (path) DO NOTHING",
+            [path_text],
+        )?;
+        let id = self
+            .db
+            .query_row("SELECT id FROM folders WHERE path = ?1", [path_text], |row| row.get(0))?;
+        let folder = FolderInfo { id: FolderId(id), path };
+        self.add_found(folder, files)
+    }
+
+    /// Scans a remembered folder again and adds the dictionary files placed
+    /// there since (or removed from the library since: rescanning brings them
+    /// back). Dictionaries already in the library are left as they are.
+    ///
+    /// A folder that can't be read any more is an `Err`; it stays remembered.
+    pub fn rescan_folder(&mut self, id: FolderId) -> Result<FolderScan, LibraryError> {
+        let folder = self
+            .folders()?
+            .into_iter()
+            .find(|f| f.id == id)
+            .ok_or(LibraryError::UnknownFolder(id))?;
+        let files = find_dictionary_files(&folder.path)?;
+        self.add_found(folder, files)
+    }
+
+    /// Every remembered folder, in the order added.
+    pub fn folders(&self) -> Result<Vec<FolderInfo>, LibraryError> {
+        let mut stmt = self.db.prepare_cached("SELECT id, path FROM folders ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FolderInfo {
+                id: FolderId(row.get(0)?),
+                path: PathBuf::from(row.get::<_, String>(1)?),
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forgets folder `id`, so it is no longer offered for rescanning, and
+    /// returns the remaining folders. The dictionaries found in it stay in
+    /// the library.
+    pub fn remove_folder(&mut self, id: FolderId) -> Result<Vec<FolderInfo>, LibraryError> {
+        if self.db.execute("DELETE FROM folders WHERE id = ?1", [id.0])? == 0 {
+            return Err(LibraryError::UnknownFolder(id));
+        }
+        self.folders()
+    }
+
+    /// Adds each of `files` (normalized) that isn't in the library yet.
+    fn add_found(
+        &mut self,
+        folder: FolderInfo,
+        files: Vec<PathBuf>,
+    ) -> Result<FolderScan, LibraryError> {
+        let mut added = Vec::new();
+        for file in files {
+            let (info, new) = self.add_normalized(&normalize(&file)?)?;
+            if new {
+                added.push(info);
+            }
+        }
+        Ok(FolderScan { folder, added })
+    }
+
+    /// [`add_file`](Self::add_file) for a [`normalize`]d path. The flag says
+    /// whether the dictionary is new (false: it was already in the library).
+    fn add_normalized(&mut self, path: &Path) -> Result<(DictionaryInfo, bool), LibraryError> {
+        let path_text = path_text(path)?;
         if let Some(existing) = self.find_by_path(path_text)? {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
-        let stamp = FileStamp::read(&path);
-        let (title, failure) = match format::open(&path) {
+        let stamp = FileStamp::read(path);
+        let (title, failure) = match format::open(path) {
             Ok(dict) => {
                 let title = dict.metadata().title.clone();
                 match self.insert_indexed(path_text, &title, stamp, dict.as_ref())? {
                     Ok(id) => {
                         // Already open: keep it for the articles to come.
                         self.lock_readers().insert(id, Arc::from(dict));
-                        return self.get(id);
+                        return Ok((self.get(id)?, true));
                     }
                     Err(error) => (title, error),
                 }
             }
-            Err(error) => (format::display_title(None, &path), error),
+            Err(error) => (format::display_title(None, path), error),
         };
         let id = self.insert_failed(path_text, &title, stamp, &failure.to_string())?;
-        self.get(id)
+        Ok((self.get(id)?, true))
     }
 
     /// Every dictionary in library order.
@@ -456,6 +539,58 @@ impl Library {
     }
 }
 
+/// The one spelling of `path` the library stores: canonical (`.` and `..`
+/// resolved, links followed, the on-disk letter case on Windows) when the
+/// file exists, so the same file is never added twice; otherwise just made
+/// absolute.
+fn normalize(path: &Path) -> Result<PathBuf, LibraryError> {
+    match dunce::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(_) => Ok(std::path::absolute(path)?),
+    }
+}
+
+fn path_text(path: &Path) -> Result<&str, LibraryError> {
+    path.to_str().ok_or_else(|| LibraryError::PathNotUnicode(path.to_owned()))
+}
+
+fn folder_error(path: &Path, error: io::Error) -> LibraryError {
+    LibraryError::Folder(path.to_owned(), error)
+}
+
+/// Every dictionary file under `folder`, recursively, sorted by path.
+///
+/// Only `.mdx` files (any letter case) for now; companion files such as
+/// `.mdd` volumes are found from them. Linked subfolders are not followed,
+/// so a link loop can't trap the scan. Subfolders that can't be read are
+/// skipped; `folder` itself must be readable.
+fn find_dictionary_files(folder: &Path) -> Result<Vec<PathBuf>, LibraryError> {
+    let mut found = Vec::new();
+    let mut pending = vec![folder.to_owned()];
+    while let Some(dir) = pending.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if dir == folder => return Err(folder_error(folder, error)),
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if is_dictionary_file(&path) && path.is_file() {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+fn is_dictionary_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mdx"))
+}
+
 /// Inserts a dictionary row at the end of the library order.
 fn insert_dictionary(
     tx: &Transaction<'_>,
@@ -581,6 +716,46 @@ impl fmt::Display for DictionaryId {
     }
 }
 
+/// Identifies a remembered folder within one library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FolderId(i64);
+
+impl FolderId {
+    /// The id for a number previously produced by [`FolderId::to_raw`].
+    pub const fn from_raw(raw: i64) -> Self {
+        Self(raw)
+    }
+
+    /// The number to hand to the frontend.
+    pub const fn to_raw(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for FolderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A folder the user added: see [`Library::add_folder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderInfo {
+    pub id: FolderId,
+    /// Canonical absolute path of the folder.
+    pub path: PathBuf,
+}
+
+/// What adding or rescanning a folder did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderScan {
+    pub folder: FolderInfo,
+    /// The dictionaries this scan added to the library, in path order,
+    /// unusable ones (with [`Status::Error`]) included. Files that were
+    /// already in the library are not listed.
+    pub added: Vec<DictionaryInfo>,
+}
+
 /// A dictionary as the library lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictionaryInfo {
@@ -680,6 +855,11 @@ pub enum LibraryError {
     PathNotUnicode(PathBuf),
     /// No dictionary in the library has this id.
     UnknownDictionary(DictionaryId),
+    /// The library remembers no folder with this id.
+    UnknownFolder(FolderId),
+    /// A folder to add or rescan could not be read (missing, not a folder,
+    /// no permission).
+    Folder(PathBuf, io::Error),
 }
 
 impl fmt::Display for LibraryError {
@@ -695,6 +875,8 @@ impl fmt::Display for LibraryError {
                 write!(f, "unsupported file path (not valid Unicode): {}", p.display())
             }
             Self::UnknownDictionary(id) => write!(f, "no dictionary with id {id} in the library"),
+            Self::UnknownFolder(id) => write!(f, "no folder with id {id} in the library"),
+            Self::Folder(p, e) => write!(f, "cannot read folder {}: {e}", p.display()),
         }
     }
 }
@@ -703,7 +885,7 @@ impl std::error::Error for LibraryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(e) => Some(e),
-            Self::Io(e) => Some(e),
+            Self::Io(e) | Self::Folder(_, e) => Some(e),
             _ => None,
         }
     }
